@@ -114,10 +114,10 @@ impl Gui {
                 Task::none()
             }
             Message::Pause(i) => {
-                if let Some(item) = self.downloads.get(i) {
-                    if let Some(cancel) = &item.cancel {
-                        cancel.cancel();
-                    }
+                if let Some(item) = self.downloads.get(i)
+                    && let Some(cancel) = &item.cancel
+                {
+                    cancel.cancel();
                 }
                 Task::none()
             }
@@ -132,10 +132,10 @@ impl Gui {
                 Task::none()
             }
             Message::Remove(i) => {
-                if let Some(item) = self.downloads.get(i) {
-                    if let Some(cancel) = &item.cancel {
-                        cancel.cancel();
-                    }
+                if let Some(item) = self.downloads.get(i)
+                    && let Some(cancel) = &item.cancel
+                {
+                    cancel.cancel();
                 }
                 self.downloads.remove(i);
                 Task::none()
@@ -150,11 +150,11 @@ impl Gui {
             return;
         };
         let (tx, rx) = watch::channel(Progress::default());
-        *item.rx_slot.lock().unwrap() = Some(rx);
+        *item.rx_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rx);
         item.status.store(st::RUNNING, Ordering::Relaxed);
         item.state = State::Running;
         item.error_text = None;
-        *item.error.lock().unwrap() = None;
+        *item.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         item.cancel = Some(cancel.clone());
 
         let url = item.url.clone();
@@ -162,12 +162,15 @@ impl Gui {
         let status = item.status.clone();
         let error = item.error.clone();
         rt().spawn(async move {
-            let result = HttpDownload::new(url, dest).run(cancel, tx).await;
+            let result = match HttpDownload::new(url, dest) {
+                Ok(task) => task.run(cancel, tx).await,
+                Err(e) => Err(e),
+            };
             match result {
                 Ok(_) => status.store(st::FINISHED, Ordering::Relaxed),
                 Err(DownloadError::Cancelled) => status.store(st::PAUSED, Ordering::Relaxed),
                 Err(e) => {
-                    *error.lock().unwrap() = Some(e.to_string());
+                    *error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.to_string());
                     status.store(st::FAILED, Ordering::Relaxed);
                 }
             }
@@ -176,7 +179,7 @@ impl Gui {
 
     fn refresh(&mut self) {
         for item in &mut self.downloads {
-            if let Some(rx) = item.rx_slot.lock().unwrap().as_ref() {
+            if let Some(rx) = item.rx_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
                 item.progress = *rx.borrow();
             }
             item.state = match item.status.load(Ordering::Relaxed) {
@@ -186,7 +189,7 @@ impl Gui {
                 _ => State::Failed,
             };
             if item.state == State::Failed && item.error_text.is_none() {
-                item.error_text = item.error.lock().unwrap().clone();
+                item.error_text = item.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             }
         }
     }

@@ -39,10 +39,13 @@ fn cli_download(args: &[String]) {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(download_impl(args));
+    if let Err(e) = rt.block_on(download_impl(args)) {
+        eprintln!("failed: {e}");
+        std::process::exit(1);
+    }
 }
 
-async fn download_impl(args: &[String]) {
+async fn download_impl(args: &[String]) -> Result<(), xdm_core::http::DownloadError> {
     let (Some(url), Some(dest)) = (args.first(), args.get(1)) else {
         usage();
     };
@@ -50,7 +53,7 @@ async fn download_impl(args: &[String]) {
 
     let cancel = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::watch::channel(Progress::default());
-    let task = HttpDownload::new(url.clone(), dest);
+    let task = HttpDownload::new(url.clone(), dest)?;
     let run_cancel = cancel.clone();
     let mut handle = tokio::spawn(async move { task.run(run_cancel, tx).await });
 
@@ -78,16 +81,15 @@ async fn download_impl(args: &[String]) {
                         eprintln!("download paused");
                         std::process::exit(130);
                     }
-                    Ok(Err(e)) => {
-                        eprintln!("failed: {e}");
-                        std::process::exit(1);
-                    }
+                    Ok(Err(e)) => return Err(e),
                     Err(join) => eprintln!("download task panicked: {join}"),
                 }
                 break;
             }
         }
     }
+
+    Ok(())
 }
 
 fn print_progress(p: &Progress) {

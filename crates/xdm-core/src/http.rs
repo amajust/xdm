@@ -1,9 +1,19 @@
-//! Segmented, resumable HTTP downloader.
+//! Segmented, resumable HTTP downloader with dynamic chunk splitting and
+//! chunk stealing.
 //!
 //! Rust port of xdm-core's `HttpDownloaderTask` / `HttpChunkRetriever`:
 //! - one probe request detects range support, total size, and a validator,
-//! - the file is split across up to `max_chunks` connections (even split),
-//! - every chunk streams into the same destination file at its own offset,
+//! - the download starts as a **single** connection; a coordinator loop
+//!   repeatedly splits the largest chunk while connections are free
+//!   (`split_offsets`, min 1 MiB per half),
+//! - a connection that stops making progress for `STALL_MS` has its tail
+//!   **stolen** by a fresh connection (`takeOverChunk` in the original): the
+//!   stalled chunk's end shrinks to its current position and a new chunk
+//!   carries the remaining range,
+//! - chunk ends are shared atomics; every task re-reads its end before each
+//!   write, so a shrunk chunk can never write past it — the file can only
+//!   ever receive each byte from one owner (modulo same-content overlap in a
+//!   tiny check-then-write race, which is harmless),
 //! - per-chunk state is persisted periodically and on cancel/failure, so a
 //!   crash loses at most one save interval,
 //! - resume sends `If-Range` (ETag / Last-Modified); a stale validator fails
@@ -13,7 +23,7 @@
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
@@ -21,18 +31,24 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const USER_AGENT: &str = concat!("xdm-rs/", env!("CARGO_PKG_VERSION"));
 /// Never split below this size (the original split halves of >= 256 KB).
 const MIN_CHUNK_SIZE: u64 = 1024 * 1024;
-/// Retries per chunk (request failures and mid-stream reconnects).
+/// Retries per chunk without progress (request failures and mid-stream
+/// reconnects). Any successful write resets the budget.
 const MAX_ATTEMPTS: u32 = 10;
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Idle timeout between body reads; a stalled server drops the connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A connection with no written bytes for this long gets its tail stolen.
+const STALL_MS: u64 = 5000;
+/// How often the coordinator re-evaluates splits, steals, and completion.
+const COORDINATOR_TICK: Duration = Duration::from_millis(250);
 /// How often per-chunk state is flushed to disk while running.
 const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Sentinel end for an open-ended chunk (unknown total size).
@@ -95,6 +111,68 @@ pub struct ChunkState {
     pub done: bool,
 }
 
+/// The live, shared form of a chunk. `end` is mutable: the coordinator
+/// shrinks it when splitting or stealing. Tasks re-read it before every
+/// write, which is what makes shrinking safe.
+struct SharedChunk {
+    start: u64,
+    /// Inclusive; `OPEN_ENDED` = unknown size, never split.
+    end: AtomicU64,
+    downloaded: AtomicU64,
+    done: AtomicBool,
+    spawned: AtomicBool,
+    failed: AtomicBool,
+    error: Mutex<Option<DownloadError>>,
+    /// Unix millis of the last successful write (creation time initially).
+    last_progress_ms: AtomicU64,
+}
+
+impl SharedChunk {
+    fn new(start: u64, end: u64) -> Self {
+        Self {
+            start,
+            end: AtomicU64::new(end),
+            downloaded: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+            spawned: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            error: Mutex::new(None),
+            last_progress_ms: AtomicU64::new(now_ms()),
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.start + self.downloaded.load(Ordering::Relaxed)
+    }
+
+    fn remaining(&self) -> Option<u64> {
+        let end = self.end.load(Ordering::Relaxed);
+        if end == OPEN_ENDED {
+            return None;
+        }
+        let pos = self.position();
+        Some(if pos > end { 0 } else { end - pos + 1 })
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    fn is_running(&self) -> bool {
+        self.spawned.load(Ordering::Relaxed) && !self.is_done()
+    }
+}
+
+/// Immutable-per-run inputs shared by every chunk task.
+struct RunCtx {
+    client: Client,
+    url: String,
+    dest: PathBuf,
+    accept_ranges: bool,
+    validator: Option<String>,
+    total_downloaded: Arc<AtomicU64>,
+}
+
 pub struct HttpDownload {
     client: Client,
     url: String,
@@ -104,7 +182,7 @@ pub struct HttpDownload {
 }
 
 impl HttpDownload {
-    pub fn new(url: impl Into<String>, dest: impl Into<PathBuf>) -> Self {
+    pub fn new(url: impl Into<String>, dest: impl Into<PathBuf>) -> Result<Self, DownloadError> {
         Self::with_config(url, dest, DownloadConfig::default())
     }
 
@@ -112,7 +190,7 @@ impl HttpDownload {
         url: impl Into<String>,
         dest: impl Into<PathBuf>,
         config: DownloadConfig,
-    ) -> Self {
+    ) -> Result<Self, DownloadError> {
         let dest = dest.into();
         let state_name = format!(
             ".{}.xdm-state.json",
@@ -127,14 +205,14 @@ impl HttpDownload {
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
             .build()
-            .expect("reqwest client");
-        Self {
+            .map_err(DownloadError::Http)?;
+        Ok(Self {
             client,
             url: url.into(),
             dest,
             state_path,
             config,
-        }
+        })
     }
 
     /// Runs the download to completion.
@@ -173,40 +251,51 @@ impl HttpDownload {
             return Err(DownloadError::Cancelled);
         }
 
+        // Trivial case: empty file.
+        if probe.total == Some(0) {
+            tokio::fs::File::create(&self.dest).await?;
+            let _ = tokio::fs::remove_file(&self.state_path).await;
+            return Ok(Some(0));
+        }
+
         let dest_exists = tokio::fs::try_exists(&self.dest).await.unwrap_or(false);
         let resumed = saved.as_ref().is_some_and(|s| {
-            dest_exists
-                && s.total == probe.total
-                && s.chunks.iter().any(|c| c.downloaded > 0 || c.done)
+            dest_exists && s.total == probe.total && s.chunks.iter().any(|c| c.downloaded > 0 || c.done)
         });
-        let chunks = if resumed {
-            saved.as_ref().unwrap().chunks.clone()
-        } else if probe.accept_ranges {
-            split(probe.total, self.config.max_chunks)
-        } else {
-            // No range support: one open-ended full-body connection.
-            vec![ChunkState { start: 0, end: OPEN_ENDED, downloaded: 0, done: false }]
-        };
 
-        // Fresh start (or resuming onto a vanished file): truncate/preallocate.
-        if !resumed {
+        // The engine has its own cancel token, derived from the user's, so a
+        // failed chunk can stop its siblings without reporting "cancelled"
+        // to the caller.
+        let internal = cancel.child_token();
+        let total_downloaded = Arc::new(AtomicU64::new(0));
+
+        let chunks: Arc<Mutex<Vec<Arc<SharedChunk>>>> = Arc::new(Mutex::new(Vec::new()));
+        if resumed {
+            if let Some(saved) = saved.as_ref() {
+                let mut table =
+                    chunks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for c in &saved.chunks {
+                    total_downloaded.fetch_add(c.downloaded, Ordering::Relaxed);
+                    let sc = SharedChunk::new(c.start, c.end);
+                    sc.downloaded.store(c.downloaded, Ordering::Relaxed);
+                    sc.done.store(c.done, Ordering::Relaxed);
+                    sc.spawned.store(c.done, Ordering::Relaxed); // done chunks need no task
+                    table.push(Arc::new(sc));
+                }
+            }
+        } else {
+            // Fresh start: one connection covering everything; the
+            // coordinator splits it while connections are free.
             let f = tokio::fs::File::create(&self.dest).await?;
             if let Some(total) = probe.total {
                 f.set_len(total).await?;
             }
             f.sync_all().await?;
+            let end = probe.total.map_or(OPEN_ENDED, |t| t - 1);
+            chunks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::new(SharedChunk::new(0, end)));
         }
 
-        let total_downloaded = Arc::new(AtomicU64::new(0));
-        let chunk_downloaded: Vec<Arc<AtomicU64>> = chunks
-            .iter()
-            .map(|c| Arc::new(AtomicU64::new(c.downloaded)))
-            .collect();
-        let chunk_done: Vec<Arc<AtomicBool>> =
-            chunks.iter().map(|_| Arc::new(AtomicBool::new(false))).collect();
-
-        let initial: u64 = chunks.iter().map(|c| c.downloaded).sum();
-        total_downloaded.store(initial, Ordering::Relaxed);
+        let initial: u64 = total_downloaded.load(Ordering::Relaxed);
         let _ = progress.send(Progress { downloaded: initial, total: probe.total });
 
         // Progress ticker: publishes the shared counter every 250 ms.
@@ -234,10 +323,8 @@ impl HttpDownload {
             let last_modified = probe.last_modified.clone();
             let total = probe.total;
             let accept_ranges = probe.accept_ranges;
-            let geometry = chunks.clone();
-            let downloaded = chunk_downloaded.clone();
-            let done = chunk_done.clone();
-            let cancel_p = cancel.clone();
+            let chunks = chunks.clone();
+            let cancel_p = internal.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(STATE_SAVE_INTERVAL);
                 interval.tick().await; // first tick fires immediately; skip it
@@ -246,55 +333,145 @@ impl HttpDownload {
                         _ = interval.tick() => {}
                         _ = cancel_p.cancelled() => break,
                     }
-                    let merged = merge_progress(&geometry, &downloaded, &done);
-                    let state = build_state(&url, total, &etag, &last_modified, accept_ranges, &merged);
+                    let snapshot = snapshot_chunks(&chunks);
+                    let state = build_state(&url, total, &etag, &last_modified, accept_ranges, &snapshot);
                     save_state(&state_path, &state).await;
                 }
             })
         };
 
-        // One task per unfinished chunk.
-        let mut handles = Vec::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            if chunk.done {
-                continue;
+        let ctx = RunCtx {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            dest: self.dest.clone(),
+            accept_ranges: probe.accept_ranges,
+            validator: probe.validator(),
+            total_downloaded: total_downloaded.clone(),
+        };
+
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        {
+            let table = chunks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for c in table.iter().filter(|c| !c.is_done()) {
+                spawn_chunk(&ctx, c.clone(), internal.clone(), &mut handles);
             }
-            handles.push(tokio::spawn(run_chunk(
-                self.client.clone(),
-                self.url.clone(),
-                probe.validator(),
-                chunk.start,
-                chunk.end,
-                chunk_downloaded[i].clone(),
-                chunk_done[i].clone(),
-                total_downloaded.clone(),
-                self.dest.clone(),
-                probe.accept_ranges,
-                cancel.clone(),
-            )));
         }
 
-        let mut result = Ok(());
+        let mut failure: Option<DownloadError> = None;
+        loop {
+            if cancel.is_cancelled() {
+                failure = Some(DownloadError::Cancelled);
+                break;
+            }
+
+            let mut all_done = true;
+            let mut active = 0usize;
+            let mut chunk_failed = false;
+            {
+                let table = chunks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for c in table.iter() {
+                    if c.is_done() {
+                        continue;
+                    }
+                    all_done = false;
+                    if c.failed.load(Ordering::Relaxed) {
+                        chunk_failed = true;
+                        break;
+                    }
+                    if c.is_running() {
+                        active += 1;
+                    }
+                }
+            }
+            if chunk_failed {
+                failure = take_failure(&chunks);
+                break;
+            }
+            if all_done {
+                break;
+            }
+
+            if active < self.config.max_chunks {
+                let mut table = chunks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now = now_ms();
+
+                // 1) Rescue stalled connections: hand their tail to a fresh one.
+                let mut steals: Vec<(Arc<SharedChunk>, u64, u64)> = Vec::new();
+                for c in table.iter() {
+                    if active + steals.len() >= self.config.max_chunks {
+                        break;
+                    }
+                    if !c.is_running() {
+                        continue;
+                    }
+                    let stalled =
+                        now.saturating_sub(c.last_progress_ms.load(Ordering::Relaxed)) > STALL_MS;
+                    if !stalled {
+                        continue;
+                    }
+                    let pos = c.position();
+                    let end = c.end.load(Ordering::Relaxed);
+                    if end == OPEN_ENDED || pos > end {
+                        continue;
+                    }
+                    let remaining = end - pos + 1;
+                    if remaining < 2 * MIN_CHUNK_SIZE {
+                        continue;
+                    }
+                    let head_end = pos + remaining / 2 - 1;
+                    steals.push((c.clone(), head_end, end));
+                }
+                for (c, head_end, end) in steals {
+                    c.end.store(head_end, Ordering::Relaxed);
+                    let tail = Arc::new(SharedChunk::new(head_end + 1, end));
+                    table.push(tail.clone());
+                    active += 1;
+                    tracing::debug!(from = c.start, stolen_at = head_end + 1, "stalled chunk tail stolen");
+                    spawn_chunk(&ctx, tail, internal.clone(), &mut handles);
+                }
+
+                // 2) Grow: split the largest chunk while connections are free.
+                if active < self.config.max_chunks {
+                    let mut best: Option<(u64, Arc<SharedChunk>)> = None;
+                    for c in table.iter() {
+                        if !c.is_running() {
+                            continue;
+                        }
+                        if let Some(remaining) = c.remaining()
+                            && remaining >= 2 * MIN_CHUNK_SIZE
+                            && best.as_ref().is_none_or(|(br, _)| remaining > *br)
+                        {
+                            best = Some((remaining, c.clone()));
+                        }
+                    }
+                    if let Some((_, c)) = best {
+                        let pos = c.position();
+                        let end = c.end.load(Ordering::Relaxed);
+                        if let Some((head_end, tail_start)) = split_offsets(pos, end) {
+                            c.end.store(head_end, Ordering::Relaxed);
+                            let tail = Arc::new(SharedChunk::new(tail_start, end));
+                            table.push(tail.clone());
+                            tracing::debug!(at = tail_start, "split chunk");
+                            spawn_chunk(&ctx, tail, internal.clone(), &mut handles);
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(COORDINATOR_TICK).await;
+        }
+
+        // Stop all tasks (no-op when they already finished) and reap them.
+        internal.cancel();
         for handle in handles {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    result = Err(e);
-                    break;
-                }
-                Err(join) => {
-                    result = Err(DownloadError::Io(std::io::Error::other(join)));
-                    break;
-                }
-            }
+            let _ = handle.await;
         }
-
-        ticker.abort();
         persister.abort();
+        ticker.abort();
 
-        let merged = merge_progress(&chunks, &chunk_downloaded, &chunk_done);
-        match result {
-            Ok(()) => {
+        let snapshot = snapshot_chunks(&chunks);
+        match failure {
+            None => {
                 let _ = tokio::fs::remove_file(&self.state_path).await;
                 let _ = progress.send(Progress {
                     downloaded: total_downloaded.load(Ordering::Relaxed),
@@ -302,14 +479,14 @@ impl HttpDownload {
                 });
                 Ok(probe.total)
             }
-            Err(e) => {
+            Some(e) => {
                 let state = build_state(
                     &self.url,
                     probe.total,
                     &probe.etag,
                     &probe.last_modified,
                     probe.accept_ranges,
-                    &merged,
+                    &snapshot,
                 );
                 save_state(&self.state_path, &state).await;
                 tracing::warn!(error = %e, "download interrupted; state saved for resume");
@@ -327,10 +504,10 @@ impl HttpDownload {
     /// One tiny range request to learn range support, total size, validator.
     async fn probe(&self, saved: Option<&DownloadState>) -> Result<ProbeInfo, DownloadError> {
         let mut req = self.client.get(&self.url).header(RANGE, "bytes=0-0");
-        if let Some(saved) = saved {
-            if let Some(v) = saved.etag.as_deref().or(saved.last_modified.as_deref()) {
-                req = req.header(IF_RANGE, v);
-            }
+        if let Some(saved) = saved
+            && let Some(v) = saved.etag.as_deref().or(saved.last_modified.as_deref())
+        {
+            req = req.header(IF_RANGE, v);
         }
         let resp = req.send().await?.error_for_status()?;
         let status = resp.status();
@@ -386,44 +563,47 @@ impl ProbeInfo {
     }
 }
 
-/// Evenly splits `total` bytes across at most `max_chunks` chunks
-/// (inclusive ranges), never below `MIN_CHUNK_SIZE`.
-fn split(total: Option<u64>, max_chunks: usize) -> Vec<ChunkState> {
-    let Some(total) = total else {
-        return vec![ChunkState { start: 0, end: OPEN_ENDED, downloaded: 0, done: false }];
-    };
-    if total == 0 {
-        return vec![ChunkState { start: 0, end: 0, downloaded: 0, done: true }];
+/// Where to split a chunk whose next unwritten byte is `pos`, given the
+/// inclusive `end`. Returns `(head_end, tail_start)`, keeping both halves
+/// at least `MIN_CHUNK_SIZE` — or `None` when splitting isn't worthwhile.
+fn split_offsets(pos: u64, end: u64) -> Option<(u64, u64)> {
+    if end == OPEN_ENDED {
+        return None;
     }
-    let count = ((total / MIN_CHUNK_SIZE).max(1) as usize).min(max_chunks.max(1));
-    let per = total / count as u64;
-    let mut chunks = Vec::with_capacity(count);
-    let mut start = 0;
-    for i in 0..count {
-        // Last chunk absorbs the remainder.
-        let end = if i == count - 1 { total - 1 } else { start + per - 1 };
-        chunks.push(ChunkState { start, end, downloaded: 0, done: false });
-        start = end + 1;
+    let remaining = end.checked_sub(pos)? + 1;
+    if remaining < 2 * MIN_CHUNK_SIZE {
+        return None;
     }
-    chunks
+    let head_end = pos + remaining / 2 - 1;
+    Some((head_end, head_end + 1))
 }
 
-/// Rebuilds the chunk list with live counters merged into the saved geometry.
-fn merge_progress(
-    geometry: &[ChunkState],
-    downloaded: &[Arc<AtomicU64>],
-    done: &[Arc<AtomicBool>],
-) -> Vec<ChunkState> {
-    geometry
+fn snapshot_chunks(chunks: &Mutex<Vec<Arc<SharedChunk>>>) -> Vec<ChunkState> {
+    chunks
+        .lock()
+        .unwrap()
         .iter()
-        .enumerate()
-        .map(|(i, c)| ChunkState {
+        .map(|c| ChunkState {
             start: c.start,
-            end: c.end,
-            downloaded: downloaded[i].load(Ordering::Relaxed),
-            done: done[i].load(Ordering::Relaxed),
+            end: c.end.load(Ordering::Relaxed),
+            downloaded: c.downloaded.load(Ordering::Relaxed),
+            done: c.done.load(Ordering::Relaxed),
         })
         .collect()
+}
+
+fn take_failure(chunks: &Mutex<Vec<Arc<SharedChunk>>>) -> Option<DownloadError> {
+    let table = chunks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for c in table.iter() {
+        if c.failed.load(Ordering::Relaxed) {
+            let err = c.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            return Some(err.unwrap_or(DownloadError::ExhaustedRetries {
+                attempts: MAX_ATTEMPTS,
+                last_error: "chunk failed".to_owned(),
+            }));
+        }
+    }
+    None
 }
 
 fn build_state(
@@ -481,52 +661,89 @@ fn end_suffix(end: u64) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_chunk(
-    client: Client,
-    url: String,
-    validator: Option<String>,
-    start: u64,
-    end: u64,
-    downloaded: Arc<AtomicU64>,
-    done: Arc<AtomicBool>,
-    total_downloaded: Arc<AtomicU64>,
-    dest: PathBuf,
-    accept_ranges: bool,
-    cancel: CancellationToken,
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn backoff(attempt: u32) -> Duration {
+    (RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)
+}
+
+fn spawn_chunk(
+    ctx: &RunCtx,
+    chunk: Arc<SharedChunk>,
+    internal: CancellationToken,
+    handles: &mut Vec<JoinHandle<()>>,
+) {
+    if chunk.spawned.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let task_ctx = RunCtx {
+        client: ctx.client.clone(),
+        url: ctx.url.clone(),
+        dest: ctx.dest.clone(),
+        accept_ranges: ctx.accept_ranges,
+        validator: ctx.validator.clone(),
+        total_downloaded: ctx.total_downloaded.clone(),
+    };
+    handles.push(tokio::spawn(run_chunk(task_ctx, chunk, internal)));
+}
+
+async fn run_chunk(ctx: RunCtx, chunk: Arc<SharedChunk>, internal: CancellationToken) {
+    let result = run_chunk_inner(&ctx, &chunk, &internal).await;
+    // User/initiated cancellations are not chunk failures.
+    if let Err(e) = result
+        && !matches!(&e, DownloadError::Cancelled)
+    {
+        chunk
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(e);
+        chunk.failed.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn run_chunk_inner(
+    ctx: &RunCtx,
+    chunk: &SharedChunk,
+    internal: &CancellationToken,
 ) -> Result<(), DownloadError> {
-    let expected = (end != OPEN_ENDED).then(|| end - start + 1);
-    let mut attempt = 0u32;
+    let mut attempt: u32 = 0;
+    let mut last_error = "unknown".to_owned();
     loop {
-        if cancel.is_cancelled() {
+        if internal.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
         attempt += 1;
 
-        let offset = start + downloaded.load(Ordering::Relaxed);
-        if expected.is_some_and(|len| downloaded.load(Ordering::Relaxed) >= len) {
-            done.store(true, Ordering::Relaxed);
+        let offset = chunk.position();
+        let end = chunk.end.load(Ordering::Relaxed);
+        if end != OPEN_ENDED && offset > end {
+            // Everything we owned is written (possibly after a shrink).
+            chunk.done.store(true, Ordering::Relaxed);
             return Ok(());
         }
 
-        let mut req = client.get(&url);
-        if accept_ranges {
+        let mut req = ctx.client.get(&ctx.url);
+        if ctx.accept_ranges {
             req = req.header(RANGE, format!("bytes={offset}-{}", end_suffix(end)));
-            if let Some(v) = &validator {
+            if let Some(v) = &ctx.validator {
                 req = req.header(IF_RANGE, v);
             }
         }
         let mut resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
+                last_error = e.to_string();
                 if attempt >= MAX_ATTEMPTS {
-                    return Err(DownloadError::ExhaustedRetries {
-                        attempts: MAX_ATTEMPTS,
-                        last_error: e.to_string(),
-                    });
+                    return Err(DownloadError::ExhaustedRetries { attempts: attempt, last_error });
                 }
-                tracing::debug!(error = %e, chunk_start = start, "chunk request failed; retrying");
-                tokio::time::sleep((RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)).await;
+                tracing::debug!(error = %e, chunk_start = chunk.start, "chunk request failed; retrying");
+                tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
         };
@@ -534,73 +751,84 @@ async fn run_chunk(
         match resp.status() {
             StatusCode::PARTIAL_CONTENT => {}
             // Full body is only acceptable for a range-less server from offset 0.
-            StatusCode::OK if !accept_ranges && offset == 0 => {}
+            StatusCode::OK if !ctx.accept_ranges && offset == 0 => {}
             StatusCode::OK => return Err(DownloadError::RestartRequired),
             s if s.is_success() => return Err(DownloadError::RestartRequired),
             s => {
+                last_error = format!("unexpected status {s}");
                 if attempt >= MAX_ATTEMPTS {
-                    return Err(DownloadError::ExhaustedRetries {
-                        attempts: MAX_ATTEMPTS,
-                        last_error: format!("unexpected status {s}"),
-                    });
+                    return Err(DownloadError::ExhaustedRetries { attempts: attempt, last_error });
                 }
-                tracing::debug!(status = %s, chunk_start = start, "unexpected status; retrying");
-                tokio::time::sleep((RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)).await;
+                tracing::debug!(status = %s, chunk_start = chunk.start, "unexpected status; retrying");
+                tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
         }
 
-        let mut file = tokio::fs::OpenOptions::new().write(true).open(&dest).await?;
+        let mut file = tokio::fs::OpenOptions::new().write(true).open(&ctx.dest).await?;
         file.seek(SeekFrom::Start(offset)).await?;
 
-        let interrupted;
-        loop {
-            if cancel.is_cancelled() {
+        'stream: loop {
+            if internal.is_cancelled() {
                 return Err(DownloadError::Cancelled);
             }
             match resp.chunk().await {
                 Ok(Some(bytes)) => {
-                    file.write_all(&bytes).await?;
-                    let n = bytes.len() as u64;
-                    downloaded.fetch_add(n, Ordering::Relaxed);
-                    total_downloaded.fetch_add(n, Ordering::Relaxed);
+                    let mut piece: &[u8] = &bytes;
+                    while !piece.is_empty() {
+                        // Re-read the (mutable) end before every write: the
+                        // coordinator may have split or stolen our tail.
+                        let cur_end = chunk.end.load(Ordering::Relaxed);
+                        let pos = chunk.position();
+                        let allowed: u64 = if cur_end == OPEN_ENDED {
+                            piece.len() as u64
+                        } else if pos > cur_end {
+                            0
+                        } else {
+                            (cur_end - pos + 1).min(piece.len() as u64)
+                        };
+                        if allowed == 0 {
+                            // Our remaining range belongs to someone else now.
+                            chunk.done.store(true, Ordering::Relaxed);
+                            return Ok(());
+                        }
+                        let n = allowed as usize;
+                        file.write_all(&piece[..n]).await?;
+                        chunk.downloaded.fetch_add(n as u64, Ordering::Relaxed);
+                        ctx.total_downloaded.fetch_add(n as u64, Ordering::Relaxed);
+                        chunk.last_progress_ms.store(now_ms(), Ordering::Relaxed);
+                        attempt = 0; // progress resets the retry budget
+                        piece = &piece[n..];
+                    }
+                    // Finished our (possibly shrunk) range?
+                    let cur_end = chunk.end.load(Ordering::Relaxed);
+                    if cur_end != OPEN_ENDED && chunk.position() > cur_end {
+                        chunk.done.store(true, Ordering::Relaxed);
+                        return Ok(());
+                    }
                 }
                 Ok(None) => {
                     let _ = file.flush().await;
                     let _ = file.sync_all().await;
-                    let complete = expected
-                        .is_none_or(|len| downloaded.load(Ordering::Relaxed) >= len);
+                    let cur_end = chunk.end.load(Ordering::Relaxed);
+                    let complete = cur_end == OPEN_ENDED || chunk.position() > cur_end;
                     if complete {
-                        done.store(true, Ordering::Relaxed);
+                        chunk.done.store(true, Ordering::Relaxed);
                         return Ok(());
                     }
-                    interrupted = true; // premature close; reconnect from the new offset
-                    break;
+                    break 'stream; // premature close; reconnect from the new offset
                 }
                 Err(e) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(DownloadError::ExhaustedRetries {
-                            attempts: MAX_ATTEMPTS,
-                            last_error: e.to_string(),
-                        });
-                    }
-                    tracing::debug!(error = %e, chunk_start = start, "chunk stream error");
-                    interrupted = true;
-                    break;
+                    last_error = e.to_string();
+                    tracing::debug!(error = %e, chunk_start = chunk.start, "chunk stream error");
+                    break 'stream;
                 }
             }
         }
-        if !interrupted {
-            done.store(true, Ordering::Relaxed);
-            return Ok(());
-        }
         if attempt >= MAX_ATTEMPTS {
-            return Err(DownloadError::ExhaustedRetries {
-                attempts: MAX_ATTEMPTS,
-                last_error: "stream interrupted repeatedly".to_owned(),
-            });
+            return Err(DownloadError::ExhaustedRetries { attempts: attempt, last_error });
         }
-        tokio::time::sleep((RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)).await;
+        tokio::time::sleep(backoff(attempt)).await;
     }
 }
 
@@ -609,34 +837,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splits_evenly_with_remainder_on_last_chunk() {
-        let chunks = split(Some(10 * MIN_CHUNK_SIZE), 4);
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0].start, 0);
-        assert_eq!(chunks.last().unwrap().end, 10 * MIN_CHUNK_SIZE - 1);
-        for w in chunks.windows(2) {
-            assert_eq!(w[1].start, w[0].end + 1);
-        }
+    fn split_offsets_halves_the_remaining_range() {
+        let (head_end, tail_start) = split_offsets(0, 10 * MIN_CHUNK_SIZE - 1).unwrap();
+        assert_eq!(head_end, 5 * MIN_CHUNK_SIZE - 1);
+        assert_eq!(tail_start, 5 * MIN_CHUNK_SIZE);
     }
 
     #[test]
-    fn never_splits_below_min_chunk_size() {
-        let chunks = split(Some(2 * MIN_CHUNK_SIZE + 1), 8);
-        assert_eq!(chunks.len(), 2);
+    fn split_offsets_splits_from_current_position() {
+        // 6 MiB remaining from pos=2 MiB: head gets 3, tail gets 3.
+        let (head_end, tail_start) = split_offsets(2 * MIN_CHUNK_SIZE, 8 * MIN_CHUNK_SIZE - 1).unwrap();
+        assert_eq!(head_end, 5 * MIN_CHUNK_SIZE - 1);
+        assert_eq!(tail_start, 5 * MIN_CHUNK_SIZE);
     }
 
     #[test]
-    fn unknown_total_is_open_ended_single_chunk() {
-        let chunks = split(None, 8);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].end, OPEN_ENDED);
-    }
-
-    #[test]
-    fn zero_total_is_immediately_done() {
-        let chunks = split(Some(0), 8);
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].done);
+    fn split_offsets_refuses_small_or_consumed_chunks() {
+        assert!(split_offsets(0, MIN_CHUNK_SIZE - 1).is_none()); // < 2 MiB total
+        assert!(split_offsets(2 * MIN_CHUNK_SIZE, 2 * MIN_CHUNK_SIZE + 5).is_none());
+        assert!(split_offsets(5 * MIN_CHUNK_SIZE, 4 * MIN_CHUNK_SIZE).is_none()); // consumed
+        assert!(split_offsets(0, OPEN_ENDED).is_none()); // unknown size
     }
 
     #[test]
