@@ -10,6 +10,9 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use tokio_util::sync::CancellationToken;
+mod common;
+
+use common::{synthetic_audio_pes_body, synthetic_video_pes_body, top_level_boxes, TsBuilder};
 use xdm_core::engine::download;
 use xdm_core::http::DownloadConfig;
 
@@ -365,5 +368,52 @@ async fn segments_download_exactly_once_across_workers() {
     for i in 0..n {
         assert_eq!(hits.get(&format!("many/s{i}.ts")), Some(&1), "segment {i} fetched more than once");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn hls_ts_segments_are_remuxed_to_mp4() {
+    // Two HLS segments, each a synthetic TS (PAT/PMT in the first, PES in
+    // both). The engine must remux them into a fragmented MP4.
+    let mut ts = TsBuilder::new();
+    let mut seg0 = Vec::new();
+    seg0.extend(ts.pat());
+    seg0.extend(ts.pmt());
+    for pkt in ts.pes(256, 0xE0, &synthetic_video_pes_body(true), 126000, true) {
+        seg0.extend(pkt);
+    }
+    for pkt in ts.pes(257, 0xC0, &synthetic_audio_pes_body(0), 126000, false) {
+        seg0.extend(pkt);
+    }
+    let mut seg1 = Vec::new();
+    for pkt in ts.pes(256, 0xE0, &synthetic_video_pes_body(false), 129000, false) {
+        seg1.extend(pkt);
+    }
+    for pkt in ts.pes(257, 0xC0, &synthetic_audio_pes_body(1), 128000, false) {
+        seg1.extend(pkt);
+    }
+
+    let files: FileMap = [
+        ("live/index.m3u8".to_owned(), (b"#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n#EXTINF:4.0,\nseg1.ts\n#EXT-X-ENDLIST\n".to_vec(), "application/vnd.apple.mpegurl")),
+        ("live/seg0.ts".to_owned(), (seg0, "video/mp2t")),
+        ("live/seg1.ts".to_owned(), (seg1, "video/mp2t")),
+    ].into_iter().collect();
+    let (base, _hits) = spawn_map_server(files).await;
+    let dir = temp_dir("hls-remux");
+    let dest = dir.join("video.mp4");
+
+    let (tx, _rx) = tokio::sync::watch::channel(Default::default());
+    download(&format!("{base}/live/index.m3u8"), &dest, DownloadConfig::default(), CancellationToken::new(), tx)
+        .await
+        .unwrap();
+
+    let mp4 = std::fs::read(&dest).unwrap();
+    let kinds: Vec<String> = top_level_boxes(&mp4).into_iter().map(|(k, _, _)| k).collect();
+    assert_eq!(kinds.first().map(String::as_str), Some("ftyp"));
+    assert!(kinds.contains(&"moov".to_owned()));
+    assert!(kinds.contains(&"moof".to_owned()));
+    assert!(kinds.contains(&"mdat".to_owned()));
+    assert!(mp4.windows(4).any(|w| w == b"avcC"));
+    assert!(mp4.windows(4).any(|w| w == b"esds"));
     let _ = std::fs::remove_dir_all(&dir);
 }
