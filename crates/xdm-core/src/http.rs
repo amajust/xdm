@@ -526,7 +526,7 @@ async fn run_chunk(
                     });
                 }
                 tracing::debug!(error = %e, chunk_start = start, "chunk request failed; retrying");
-                tokio::time::sleep(RETRY_BACKOFF * attempt.min(16)).await;
+                tokio::time::sleep((RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)).await;
                 continue;
             }
         };
@@ -545,7 +545,7 @@ async fn run_chunk(
                     });
                 }
                 tracing::debug!(status = %s, chunk_start = start, "unexpected status; retrying");
-                tokio::time::sleep(RETRY_BACKOFF * attempt.min(16)).await;
+                tokio::time::sleep((RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)).await;
                 continue;
             }
         }
@@ -553,7 +553,7 @@ async fn run_chunk(
         let mut file = tokio::fs::OpenOptions::new().write(true).open(&dest).await?;
         file.seek(SeekFrom::Start(offset)).await?;
 
-        let mut interrupted;
+        let interrupted;
         loop {
             if cancel.is_cancelled() {
                 return Err(DownloadError::Cancelled);
@@ -600,7 +600,7 @@ async fn run_chunk(
                 last_error: "stream interrupted repeatedly".to_owned(),
             });
         }
-        tokio::time::sleep(RETRY_BACKOFF * attempt.min(16)).await;
+        tokio::time::sleep((RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)).await;
     }
 }
 

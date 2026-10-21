@@ -10,3 +10,4 @@ description = "XDM desktop app and CLI (Rust rewrite; iced UI comes later)"
 xdm-core = { path = "../xdm-core" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+iced = { version = "0.14", features = ["tokio"] }

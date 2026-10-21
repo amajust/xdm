@@ -1,5 +1,9 @@
-//! xdm-app: CLI slice of the Rust rewrite. The iced GUI lands here later;
-//! for now this exercises the engine end-to-end from the command line.
+//! xdm-app: the Rust rewrite of Xtreme Download Manager.
+//!
+//! `xdm-app` (no args) opens the iced GUI; the `download` subcommand is the
+//! headless CLI slice exercising the engine directly.
+
+mod gui;
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -7,27 +11,38 @@ use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 use xdm_core::http::{HttpDownload, Progress};
 
-const MIB: f64 = 1024.0 * 1024.0;
-
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        None | Some("gui") => {
+            if let Err(e) = gui::run() {
+                eprintln!("gui failed: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("--version" | "-V") => println!("xdm-app {}", env!("CARGO_PKG_VERSION")),
-        Some("download") => download(&args[1..]).await,
+        Some("download") => cli_download(&args[1..]),
         _ => usage(),
     }
 }
 
 fn usage() -> ! {
     eprintln!(
-        "xdm-app {} — Rust rewrite (in progress)\n\nUsage:\n  xdm-app download <url> <destination>\n  xdm-app --version",
+        "xdm-app {} — Rust rewrite (in progress)\n\nUsage:\n  xdm-app                      open the GUI\n  xdm-app download <url> <destination>\n  xdm-app --version",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2);
 }
 
-async fn download(args: &[String]) {
+fn cli_download(args: &[String]) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(download_impl(args));
+}
+
+async fn download_impl(args: &[String]) {
     let (Some(url), Some(dest)) = (args.first(), args.get(1)) else {
         usage();
     };
@@ -79,11 +94,13 @@ fn print_progress(p: &Progress) {
     match p.total {
         Some(total) if total > 0 => print!(
             "\r{:>9.2} / {:.2} MiB ({:5.1}%)",
-            p.downloaded as f64 / MIB,
-            total as f64 / MIB,
+            p.downloaded as f64 / MIB_F64,
+            total as f64 / MIB_F64,
             (p.downloaded as f64 / total as f64 * 100.0).min(100.0)
         ),
         _ => print!("\r{:>12} bytes", p.downloaded),
     }
     let _ = std::io::stdout().flush();
 }
+
+const MIB_F64: f64 = 1024.0 * 1024.0;
