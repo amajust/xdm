@@ -1,0 +1,12 @@
+[package]
+name = "xdm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "XDM desktop app and CLI (Rust rewrite; iced UI comes later)"
+
+[dependencies]
+xdm-core = { path = "../xdm-core" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

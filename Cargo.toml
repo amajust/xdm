@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/xdm-core", "crates/xdm-app"]
+
+[workspace.package]
+version = "10.0.0"
+edition = "2024"
+license = "GPL-3.0"
+authors = ["XDM contributors"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "gzip"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[profile.release]
+lto = "thin"
+strip = true

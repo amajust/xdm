@@ -1,0 +1,20 @@
+[package]
+name = "xdm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "XDM download engine: segmented, resumable HTTP downloads (Rust rewrite)"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = "0.8"
+futures = { workspace = true }
