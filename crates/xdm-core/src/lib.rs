@@ -14,5 +14,6 @@
 
 pub mod engine;
 pub mod http;
+pub mod media;
 pub mod models;
 pub mod streaming;

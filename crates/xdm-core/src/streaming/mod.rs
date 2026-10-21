@@ -93,6 +93,8 @@ struct StreamPlan {
     items: Vec<SegmentPlanItem>,
     key_urls: Vec<String>,
     output_ext: String,
+    /// Extension of the first segment URL (drives the container decision).
+    first_ext: String,
 }
 
 pub struct StreamingDownload {
@@ -382,22 +384,68 @@ impl StreamingDownload {
             DownloadError::Cancelled
         } else {
             // All segments done: assemble and publish.
+            let seg_paths: Vec<PathBuf> = (0..jobs.len())
+                .map(|i| self.seg_dir.join(format!("seg-{i:05}")))
+                .collect();
+            for (i, path) in seg_paths.iter().enumerate() {
+                if !jobs[i].done.load(Ordering::Relaxed) {
+                    return Err(DownloadError::Manifest(format!("segment {i} did not complete")));
+                }
+                let _ = path;
+            }
             let mut parts = Vec::new();
             if plan.init.is_some() {
                 parts.push(self.seg_dir.join("init"));
             }
-            for (i, job) in jobs.iter().enumerate() {
-                if !job.done.load(Ordering::Relaxed) {
-                    return Err(DownloadError::Manifest(format!("segment {i} did not complete")));
-                }
-                parts.push(self.seg_dir.join(format!("seg-{i:05}")));
-            }
+            parts.extend(seg_paths.iter().cloned());
+
+            let dest_ext = self
+                .dest
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            let manifest_named =
+                matches!(dest_ext.as_deref(), Some("m3u8") | Some("m3u") | Some("mpd"));
+
             let part_file = self.dest.with_file_name(format!(
                 ".{}.xdm-part",
                 self.dest.file_name().and_then(|n| n.to_str()).unwrap_or("download")
             ));
-            assemble::concatenate(&parts, &part_file).await?;
-            tokio::fs::rename(&part_file, &self.dest).await?;
+
+            // Container decision: TS segments are remuxed to MP4 (pure Rust,
+            // no external tools) unless the user explicitly asked for .ts;
+            // fMP4/DASH concatenate directly; anything else concatenates.
+            let mut final_dest = self.dest.clone();
+            let mut published = false;
+            if plan.first_ext == "ts" && dest_ext.as_deref() != Some("ts") {
+                let files = seg_paths.clone();
+                let out_path = part_file.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::media::mux::remux_ts_to_mp4(&files, &out_path)
+                })
+                .await
+                .map_err(|e| DownloadError::Manifest(format!("mux: {e}")));
+                match result {
+                    Ok(Ok(Some(_))) => {
+                        if manifest_named || dest_ext.as_deref() != Some("mp4") {
+                            final_dest = self.dest.with_extension("mp4");
+                        }
+                        published = true;
+                    }
+                    // No usable media or mux failure: fall back to raw TS.
+                    _ => {
+                        let _ = tokio::fs::remove_file(&part_file).await;
+                    }
+                }
+            }
+            if !published {
+                if manifest_named {
+                    let ext = if plan.first_ext == "ts" { "ts" } else { plan.output_ext.as_str() };
+                    final_dest = self.dest.with_extension(ext);
+                }
+                assemble::concatenate(&parts, &part_file).await?;
+            }
+            tokio::fs::rename(&part_file, &final_dest).await?;
             let _ = tokio::fs::remove_dir_all(&self.seg_dir).await;
             let _ = tokio::fs::remove_file(&self.state_path).await;
             return Ok(Some(total_downloaded.load(Ordering::Relaxed)));
@@ -490,8 +538,13 @@ impl StreamingDownload {
                 .map(|s| assemble::ext_from_url(&s.url))
                 .unwrap_or_else(|| "ts".to_owned()),
         };
+        let first_ext = pl
+            .segments
+            .first()
+            .map(|s| assemble::ext_from_url(&s.url))
+            .unwrap_or_else(|| "ts".to_owned());
 
-        Ok(StreamPlan { init: pl.init_segment, items, key_urls, output_ext })
+        Ok(StreamPlan { init: pl.init_segment, items, key_urls, output_ext, first_ext })
     }
 
     async fn build_dash_plan(&self, internal: &CancellationToken) -> Result<StreamPlan, DownloadError> {
@@ -506,12 +559,18 @@ impl StreamingDownload {
             .iter()
             .map(|u| SegmentPlanItem { url: u.clone(), range: None, key_idx: None, iv: None })
             .collect();
+        let first_ext = repr
+            .segments
+            .first()
+            .map(|u| assemble::ext_from_url(u))
+            .unwrap_or_else(|| "m4s".to_owned());
 
         Ok(StreamPlan {
             init: repr.init_url.map(|u| (u, None)),
             items,
             key_urls: Vec::new(),
             output_ext: ext,
+            first_ext,
         })
     }
 }
