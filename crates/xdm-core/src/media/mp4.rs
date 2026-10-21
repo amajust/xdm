@@ -259,25 +259,27 @@ impl<W: Write + Seek> Mp4Writer<W> {
         self.sequence += 1;
 
         let mut trafs: Vec<Vec<u8>> = Vec::new();
+        let mut traf_offsets: Vec<usize> = Vec::new();
         let mut payload_total = 0usize;
         for (i, t) in self.tracks.iter().enumerate() {
             let samples = &self.pending[i];
             if samples.is_empty() {
                 continue;
             }
+            // Each traf's data_offset points at ITS first byte in the mdat;
+            // samples are written in track order.
+            traf_offsets.push(payload_total);
             payload_total += samples.iter().map(|s| s.data.len()).sum::<usize>();
             trafs.push(make_traf(t.track_id, samples, &t.kind));
         }
-        let moof_size: usize =
-            8 + 16 + trafs.iter().map(|t| t.len()).sum::<usize>();
-        let data_offset = moof_size as i32 + 8;
+        let moof_size: usize = 8 + 16 + trafs.iter().map(|t| t.len()).sum::<usize>();
 
         let mut moof: Vec<u8> = Vec::with_capacity(moof_size);
         let mut mfhd = Vec::new();
         mfhd.extend_from_slice(&self.sequence.to_be_bytes());
         moof.extend_from_slice(&make_full_box(b"mfhd", 0, 0, &mfhd));
-        for traf in &mut trafs {
-            patch_trun_data_offset(traf, data_offset);
+        for (traf, base) in trafs.iter_mut().zip(&traf_offsets) {
+            patch_trun_data_offset(traf, (moof_size + 8 + base) as i32);
         }
         for traf in &trafs {
             moof.extend_from_slice(traf);
