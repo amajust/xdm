@@ -39,7 +39,7 @@ const USER_AGENT: &str = concat!("xdm-rs/", env!("CARGO_PKG_VERSION"));
 const MIN_CHUNK_SIZE: u64 = 1024 * 1024;
 /// Retries per chunk without progress (request failures and mid-stream
 /// reconnects). Any successful write resets the budget.
-const MAX_ATTEMPTS: u32 = 10;
+pub(crate) const MAX_ATTEMPTS: u32 = 10;
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -66,6 +66,10 @@ pub enum DownloadError {
     RestartRequired,
     #[error("chunk failed after {attempts} attempts (last: {last_error})")]
     ExhaustedRetries { attempts: u32, last_error: String },
+    #[error("manifest: {0}")]
+    Manifest(String),
+    #[error("decrypt: {0}")]
+    Decrypt(String),
     #[error("cancelled")]
     Cancelled,
 }
@@ -668,7 +672,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     (RETRY_BACKOFF * attempt.min(16)).min(MAX_BACKOFF)
 }
 

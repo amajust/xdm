@@ -9,7 +9,8 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use tokio_util::sync::CancellationToken;
-use xdm_core::http::{HttpDownload, Progress};
+use xdm_core::engine::download;
+use xdm_core::http::Progress;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -53,9 +54,11 @@ async fn download_impl(args: &[String]) -> Result<(), xdm_core::http::DownloadEr
 
     let cancel = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::watch::channel(Progress::default());
-    let task = HttpDownload::new(url.clone(), dest)?;
+    let url_owned = url.clone();
     let run_cancel = cancel.clone();
-    let mut handle = tokio::spawn(async move { task.run(run_cancel, tx).await });
+    let mut handle = tokio::spawn(async move {
+        download(&url_owned, dest, Default::default(), run_cancel, tx).await
+    });
 
     let mut interrupted = false;
     let mut sender_gone = false;

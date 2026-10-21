@@ -13,7 +13,8 @@ use iced::widget::{button, column, container, progress_bar, row, scrollable, tex
 use iced::{Element, Subscription, Task, Theme};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use xdm_core::http::{DownloadError, HttpDownload, Progress};
+use xdm_core::engine::download;
+use xdm_core::http::{DownloadConfig, DownloadError, Progress};
 
 const MIB: f64 = 1024.0 * 1024.0;
 
@@ -162,10 +163,7 @@ impl Gui {
         let status = item.status.clone();
         let error = item.error.clone();
         rt().spawn(async move {
-            let result = match HttpDownload::new(url, dest) {
-                Ok(task) => task.run(cancel, tx).await,
-                Err(e) => Err(e),
-            };
+            let result = download(&url, dest, DownloadConfig::default(), cancel, tx).await;
             match result {
                 Ok(_) => status.store(st::FINISHED, Ordering::Relaxed),
                 Err(DownloadError::Cancelled) => status.store(st::PAUSED, Ordering::Relaxed),
