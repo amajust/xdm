@@ -353,7 +353,7 @@ async fn segments_download_exactly_once_across_workers() {
     let total = download(
         &format!("{base}/many/index.m3u8"),
         &dest,
-        DownloadConfig { max_chunks: 6 },
+        DownloadConfig { max_chunks: 6, headers: Vec::new() },
         CancellationToken::new(),
         tx,
     )

@@ -23,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 use xdm_core::engine::download;
 use xdm_core::http::{DownloadConfig, DownloadError, DownloadState, Progress};
 
+use crate::monitor;
+
 /// How often a failed download is re-spawned automatically before giving up.
 const MAX_AUTO_RETRIES: u32 = 8;
 
@@ -213,6 +215,10 @@ pub fn run() -> iced::Result {
             Err(e) => eprintln!("xdm-app: system tray unavailable: {e:?}"),
         }
     });
+
+    // The browser-monitor server on the same runtime; it talks to the GUI
+    // exclusively through the polled command slot (like the tray).
+    rt().spawn(monitor::serve());
 
     // A daemon rather than an application: the window is just a view of the
     // running state and can be closed entirely while minimized to the tray
@@ -405,6 +411,9 @@ struct DownloadItem {
     dest: PathBuf,
     /// Display name (file name of the destination).
     name: String,
+    /// Replayed capture headers (cookie, referer, UA, ...) when this row
+    /// came in through the browser monitor; empty for manual adds.
+    headers: Vec<(String, String)>,
     /// Receiver of the current (or last) run; replaced on resume.
     rx_slot: Arc<Mutex<Option<watch::Receiver<Progress>>>>,
     status: Arc<AtomicU8>,
@@ -435,6 +444,7 @@ impl DownloadItem {
             name: self.name.clone(),
             downloaded: self.progress.downloaded,
             total: self.progress.total,
+            headers: self.headers.clone(),
         }
     }
 
@@ -537,6 +547,7 @@ fn restore_downloads(list: &SavedList) -> Vec<DownloadItem> {
             url: entry.url.clone(),
             dest,
             name: entry.name.clone(),
+            headers: entry.headers.clone(),
             progress: Progress {
                 downloaded: entry.downloaded,
                 total: entry.total,
@@ -637,28 +648,20 @@ impl Gui {
                 }
                 // Tray requests (window show, quit) arrive out of band.
                 tasks.extend(tray::take_command().map(|cmd| match cmd {
-                    tray::TrayCmd::Show => {
-                        self.confirm_quit = false;
-                        match self.window_id {
-                            // Already have a window (dialog open or window
-                            // unused): just raise it, never open a duplicate.
-                            Some(id) => iced::window::gain_focus(id),
-                            // Tray-minimized: no window exists; restore one.
-                            None => {
-                                let (id, opened) =
-                                    iced::window::open(window_settings());
-                                // The id is assigned up front, so it is
-                                // known before the open future completes.
-                                self.window_id = Some(id);
-                                opened.map(move |_| Message::GotWindowId(Some(id)))
-                            }
-                        }
-                    }
+                    tray::TrayCmd::Show => self.show_window(),
                     tray::TrayCmd::Quit => {
                         self.persist();
                         self.quit_task()
                     }
                 }));
+                // Browser monitor requests (adds, window show) arrive the
+                // same way: a static slot the server pushes into.
+                for cmd in monitor::take_commands() {
+                    match cmd {
+                        monitor::MonitorCmd::AddDownload(cand) => tasks.push(self.add_from_monitor(cand)),
+                        monitor::MonitorCmd::ShowWindow => tasks.push(self.show_window()),
+                    }
+                }
                 let retry = self.refresh();
                 self.scan_counter = self.scan_counter.wrapping_add(1);
                 if self.scan_counter % 8 == 1 {
@@ -779,6 +782,67 @@ impl Gui {
         }
     }
 
+    /// Raises the main window (or restores one after tray-minimize). Shared
+    /// by the tray's Show and the browser monitor's `/show`.
+    fn show_window(&mut self) -> Task<Message> {
+        self.confirm_quit = false;
+        match self.window_id {
+            // Already have a window (dialog open or window unused): just
+            // raise it, never open a duplicate.
+            Some(id) => iced::window::gain_focus(id),
+            // Tray-minimized: no window exists; restore one.
+            None => {
+                let (id, opened) = iced::window::open(window_settings());
+                // The id is assigned up front, so it is known before the
+                // open future completes.
+                self.window_id = Some(id);
+                opened.map(move |_| Message::GotWindowId(Some(id)))
+            }
+        }
+    }
+
+    /// Adds a download that arrived through the browser monitor (an
+    /// extension takeover, a video, or a batch item): destination
+    /// `~/Downloads/<name>`, engine started immediately, headers replayed.
+    fn add_from_monitor(&mut self, cand: monitor::DownloadCandidate) -> Task<Message> {
+        let dest = downloads_dir().join(&cand.name);
+        // A fresh add clears any earlier remove-tombstone for it.
+        self.removed.remove(dest.to_string_lossy().as_ref());
+        // An existing destination resumes that row instead of spawning a
+        // second engine on the same files (same rules as a manual add).
+        if let Some(pos) = self.downloads.iter().position(|it| it.dest == dest) {
+            let running = self.downloads[pos].state == State::Running;
+            let finished = self.downloads[pos].state == State::Finished;
+            self.selected = Some(pos);
+            // A finished download has nothing left to resume: spawning would
+            // wipe the file and re-download from byte 0.
+            if !running && !finished {
+                if let Some(item) = self.downloads.get_mut(pos) {
+                    item.external = false;
+                    item.retry_count = 0;
+                    item.retry_scheduled = false;
+                }
+                self.spawn_run(pos, CancellationToken::new());
+            }
+            return Task::none();
+        }
+        self.downloads.push(DownloadItem {
+            url: cand.url.clone(),
+            dest: dest.clone(),
+            name: cand.name.clone(),
+            headers: cand.headers.clone(),
+            // Show the captured size right away; the engine's probe
+            // corrects it in the first ticks.
+            progress: Progress { downloaded: 0, total: cand.total },
+            ..DownloadItem::default()
+        });
+        let i = self.downloads.len() - 1;
+        self.selected = Some(i);
+        self.spawn_run(i, CancellationToken::new());
+        self.persist();
+        Task::none()
+    }
+
     /// Starts (or resumes) the engine for item `i`. Resume works because the
     /// engine persists per-chunk state and reloads it in `run`.
     fn spawn_run(&mut self, i: usize, cancel: CancellationToken) {
@@ -798,10 +862,14 @@ impl Gui {
 
         let url = item.url.clone();
         let dest = item.dest.clone();
+        // Captured browser requests replay their headers on every conn of
+        // this run (config.headers wins over any state-file saved headers).
+        let headers = item.headers.clone();
+        let config = DownloadConfig { max_chunks: 8, headers };
         let status = item.status.clone();
         let error = item.error.clone();
         rt().spawn(async move {
-            let result = download(&url, dest, DownloadConfig::default(), cancel, tx).await;
+            let result = download(&url, dest, config, cancel, tx).await;
             match result {
                 Ok(_) => status.store(st::FINISHED, Ordering::Relaxed),
                 Err(DownloadError::Cancelled) => status.store(st::PAUSED, Ordering::Relaxed),
@@ -1661,7 +1729,8 @@ fn filename_from_url(url: &str) -> String {
     }
 }
 
-/// The default directory watched for engine state files.
+/// The default download folder (where state files are watched and
+/// monitor-added downloads land).
 fn downloads_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_owned())).join("Downloads")
 }
@@ -1676,6 +1745,10 @@ struct SavedEntry {
     name: String,
     downloaded: u64,
     total: Option<u64>,
+    /// Browser-capture headers, so a resumed captured download still
+    /// authorizes itself in a new process. Old list files read as empty.
+    #[serde(default)]
+    headers: Vec<(String, String)>,
 }
 
 /// The whole on-disk list. `removed` holds destinations the user deleted whose
@@ -1862,6 +1935,7 @@ mod tests {
             name: "a.pkg".to_owned(),
             downloaded: 5,
             total: Some(10),
+            headers: Vec::new(),
         };
         let list = SavedList {
             downloads: vec![entries],

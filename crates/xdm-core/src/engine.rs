@@ -26,6 +26,6 @@ pub async fn download(
     } else if path_only.ends_with(".mpd") {
         StreamingDownload::dash(url, dest, config)?.run(cancel, progress).await
     } else {
-        HttpDownload::new(url, dest)?.run(cancel, progress).await
+        HttpDownload::with_config(url, dest, config)?.run(cancel, progress).await
     }
 }

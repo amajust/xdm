@@ -29,9 +29,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::http::{DownloadConfig, DownloadError, MAX_ATTEMPTS, Progress, backoff};
 
-const USER_AGENT: &str = concat!("xdm-rs/", env!("CARGO_PKG_VERSION"));
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often segment completion is flushed to the state file.
 const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
@@ -53,6 +50,9 @@ pub struct StreamState {
     pub segments: Vec<SegmentState>,
     /// Fetched AES-128 keys (key URL → raw key bytes).
     pub keys: Vec<KeyState>,
+    /// Captured request headers (the manifest fetch must re-authorize).
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +105,10 @@ pub struct StreamingDownload {
     state_path: PathBuf,
     seg_dir: PathBuf,
     max_connections: usize,
+    /// Captured request headers from this run's config (empty for plain
+    /// downloads); a resume falls back to the headers persisted in the state
+    /// file, exactly like the segmented downloader.
+    config_headers: Vec<(String, String)>,
 }
 
 impl StreamingDownload {
@@ -122,12 +126,7 @@ impl StreamingDownload {
         let parent = dest.parent().unwrap_or_else(|| Path::new("."));
         let state_path = parent.join(format!(".{stem}.xdm-stream.json"));
         let seg_dir = parent.join(format!(".{stem}.xdm-stream"));
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            .map_err(DownloadError::Http)?;
+        let client = crate::http::build_client_with_headers(&config.headers)?;
         Ok(Self {
             client,
             url: url.into(),
@@ -136,6 +135,7 @@ impl StreamingDownload {
             state_path,
             seg_dir,
             max_connections: config.max_chunks,
+            config_headers: config.headers,
         })
     }
 
@@ -144,12 +144,23 @@ impl StreamingDownload {
     /// Same contract as [`crate::http::HttpDownload::run`]: progress on
     /// `progress`, cancel via `cancel`. Returns the total bytes written.
     pub async fn run(
-        self,
+        mut self,
         cancel: CancellationToken,
         progress: watch::Sender<Progress>,
     ) -> Result<Option<u64>, DownloadError> {
         let internal = cancel.child_token();
         let saved: Option<StreamState> = self.load_state().await;
+        // Captured-request replay: config headers win; a fresh process
+        // resuming a captured download rebuilds the client from the state
+        // file's persisted headers.
+        let effective_headers = if self.config_headers.is_empty() {
+            saved.as_ref().map(|s| s.headers.clone()).unwrap_or_default()
+        } else {
+            self.config_headers.clone()
+        };
+        if effective_headers != self.config_headers {
+            self.client = crate::http::build_client_with_headers(&effective_headers)?;
+        }
 
         // Rebuild the plan from the (re-fetched) manifest.
         let plan = match self.kind {
@@ -251,6 +262,7 @@ impl StreamingDownload {
             let url = self.url.clone();
             let kind = self.kind;
             let output_ext = plan.output_ext.clone();
+            let headers = effective_headers.clone();
             let init_url = plan.init.as_ref().map(|(u, _)| u.clone());
             let jobs = jobs.clone();
             let keys = keys.clone();
@@ -278,6 +290,7 @@ impl StreamingDownload {
                             })
                             .collect(),
                         keys: keys.clone(),
+                        headers: headers.clone(),
                     };
                     save_state(&state_path, &state).await;
                 }
@@ -467,6 +480,7 @@ impl StreamingDownload {
                 })
                 .collect(),
             keys,
+            headers: effective_headers.clone(),
         };
         save_state(&self.state_path, &state).await;
         Err(outcome)
