@@ -9,7 +9,7 @@ license = "GPL-3.0"
 authors = ["XDM contributors"]
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync", "io-util", "signal", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "gzip"] }
 futures = "0.3"

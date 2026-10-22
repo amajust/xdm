@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "XDM desktop app and CLI (Rust rewrite; iced UI comes later)"
+description = "XDM desktop app and CLI (Rust rewrite, iced GUI)"
 
 [dependencies]
 xdm-core = { path = "../xdm-core" }
