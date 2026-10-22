@@ -254,6 +254,34 @@ struct DownloadItem {
     retry_scheduled: bool,
 }
 
+impl DownloadItem {
+    /// Advances the smoothed speed estimate with a fresh progress sample.
+    /// Callers sample at their own cadence (250 ms tick for owned downloads,
+    /// ~2 s state-file scans for external ones).
+    fn sample_progress(&mut self, now: Instant) {
+        match self.last_tick {
+            Some(last) => {
+                let dt = now.duration_since(last).as_secs_f64();
+                if dt >= 0.05 {
+                    let instant =
+                        (self.progress.downloaded.saturating_sub(self.prev_downloaded)) as f64 / dt;
+                    self.speed_bps = if self.speed_bps <= 0.0 {
+                        instant
+                    } else {
+                        self.speed_bps * 0.6 + instant * 0.4
+                    };
+                    self.prev_downloaded = self.progress.downloaded;
+                    self.last_tick = Some(now);
+                }
+            }
+            None => {
+                self.prev_downloaded = self.progress.downloaded;
+                self.last_tick = Some(now);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Gui {
     url: String,
@@ -465,26 +493,10 @@ impl Gui {
                 if item.progress.downloaded > item.prev_downloaded {
                     item.retry_count = 0;
                 }
-                match item.last_tick {
-                    Some(last) => {
-                        let dt = now.duration_since(last).as_secs_f64();
-                        if dt >= 0.05 {
-                            let instant = (item.progress.downloaded.saturating_sub(item.prev_downloaded)) as f64 / dt;
-                            item.speed_bps = if item.speed_bps <= 0.0 {
-                                instant
-                            } else {
-                                item.speed_bps * 0.6 + instant * 0.4
-                            };
-                            item.prev_downloaded = item.progress.downloaded;
-                            item.last_tick = Some(now);
-                        }
-                    }
-                    None => {
-                        item.prev_downloaded = item.progress.downloaded;
-                        item.last_tick = Some(now);
-                    }
-                }
-            } else {
+                item.sample_progress(now);
+            } else if !(item.state == State::Running && item.external) {
+                // Externally-driven running rows are sampled by the scanner
+                // instead; everything else has no speed to show.
                 item.speed_bps = 0.0;
                 item.prev_downloaded = item.progress.downloaded;
                 item.last_tick = Some(now);
@@ -553,6 +565,9 @@ impl Gui {
                 item.progress.downloaded = state.chunks.iter().map(|c| c.downloaded).sum();
                 item.progress.total = state.total;
                 item.state = if *fresh { State::Running } else { State::Paused };
+                if *fresh {
+                    item.sample_progress(Instant::now());
+                }
             }
         }
 
@@ -831,7 +846,7 @@ impl Gui {
             State::Failed => palette::RED,
         };
 
-        let live = item.state == State::Running && !item.external;
+        let live = item.state == State::Running;
         let speed_text = if live { fmt_speed(item.speed_bps) } else { String::new() };
         let eta = if live {
             item.progress
