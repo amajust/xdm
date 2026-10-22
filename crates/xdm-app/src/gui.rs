@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::font::{Font, Weight};
 use iced::widget::{
@@ -20,7 +20,7 @@ use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use xdm_core::engine::download;
-use xdm_core::http::{DownloadConfig, DownloadError, Progress};
+use xdm_core::http::{DownloadConfig, DownloadError, DownloadState, Progress};
 
 /// Material palette close to the Java XDM look.
 mod palette {
@@ -237,6 +237,8 @@ struct DownloadItem {
     speed_bps: f64,
     prev_downloaded: u64,
     last_tick: Option<Instant>,
+    /// Driven by another process (e.g. the CLI); only observed, not controlled.
+    external: bool,
 }
 
 #[derive(Default)]
@@ -247,6 +249,8 @@ struct Gui {
     selected: Option<usize>,
     category: Category,
     modal_open: bool,
+    /// Tick counter; state files are re-scanned every 8th tick (~2 s).
+    scan_counter: u32,
 }
 
 impl Gui {
@@ -293,6 +297,10 @@ impl Gui {
             }
             Message::Tick => {
                 self.refresh();
+                self.scan_counter = self.scan_counter.wrapping_add(1);
+                if self.scan_counter % 8 == 1 {
+                    self.scan_state_files();
+                }
                 Task::none()
             }
             Message::Select(i) => {
@@ -304,7 +312,10 @@ impl Gui {
                 Task::none()
             }
             Message::Pause(i) => {
+                // An external download is driven by another process; we can
+                // only observe it, not pause it.
                 if let Some(item) = self.downloads.get(i)
+                    && !item.external
                     && let Some(cancel) = &item.cancel
                 {
                     cancel.cancel();
@@ -317,6 +328,9 @@ impl Gui {
                     .get(i)
                     .is_some_and(|it| it.state == State::Running);
                 if !running {
+                    if let Some(item) = self.downloads.get_mut(i) {
+                        item.external = false;
+                    }
                     self.spawn_run(i, CancellationToken::new());
                 }
                 Task::none()
@@ -402,7 +416,7 @@ impl Gui {
             }
 
             let now = Instant::now();
-            if item.state == State::Running {
+            if item.state == State::Running && !item.external {
                 match item.last_tick {
                     Some(last) => {
                         let dt = now.duration_since(last).as_secs_f64();
@@ -428,6 +442,94 @@ impl Gui {
                 item.last_tick = Some(now);
             }
         }
+    }
+
+    /// Watches the downloads directory for engine state files written by other
+    /// processes (CLI runs, a previous GUI session). New files appear as
+    /// external rows; vanished files become `Finished` (or are dropped). Files
+    /// whose destination is already tracked are skipped.
+    fn scan_state_files(&mut self) {
+        let dir = downloads_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+
+        let mut found: Vec<(PathBuf, DownloadState, bool)> = Vec::new();
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(base) = state_file_base(&name) else {
+                continue;
+            };
+            let dest = dir.join(base);
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(state) = serde_json::from_slice::<DownloadState>(&bytes) else {
+                continue;
+            };
+            let fresh = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(is_fresh)
+                .unwrap_or(false);
+            found.push((dest, state, fresh));
+        }
+
+        // Refresh progress of already-tracked external items.
+        for item in &mut self.downloads {
+            if !item.external {
+                continue;
+            }
+            if let Some((_, state, fresh)) = found.iter().find(|(dest, _, _)| *dest == item.dest) {
+                item.progress.downloaded = state.chunks.iter().map(|c| c.downloaded).sum();
+                item.progress.total = state.total;
+                item.state = if *fresh { State::Running } else { State::Paused };
+            }
+        }
+
+        // Track newly discovered state files.
+        for (dest, state, fresh) in found {
+            if self.downloads.iter().any(|it| it.dest == dest) {
+                continue;
+            }
+            let name = dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "download".to_owned());
+            self.downloads.push(DownloadItem {
+                url: state.url,
+                dest,
+                name,
+                progress: Progress {
+                    downloaded: state.chunks.iter().map(|c| c.downloaded).sum(),
+                    total: state.total,
+                },
+                state: if fresh { State::Running } else { State::Paused },
+                external: true,
+                ..DownloadItem::default()
+            });
+        }
+
+        // Drop external items whose state file vanished (finished and cleaned
+        // up, or the destination was deleted by hand).
+        self.downloads.retain_mut(|item| {
+            if !item.external {
+                return true;
+            }
+            let state_path = state_file_path(&dir, &item.name);
+            if state_path.exists() {
+                return true;
+            }
+            if item.dest.exists() {
+                item.state = State::Finished;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     fn category_shows(&self, item: &DownloadItem, cat: Category) -> bool {
@@ -471,22 +573,20 @@ impl Gui {
         let can_target = sel.is_some();
 
         let divider = || {
-            rule::vertical(24.0).style(|_| rule::Style {
-                color: palette::CARD_BORDER,
-                radius: 0.0.into(),
-                fill_mode: rule::FillMode::Full,
-                snap: true,
+            container("").width(1).height(22).style(|_| container::Style {
+                background: Some(palette::CARD_BORDER.into()),
+                ..container::Style::default()
             })
         };
 
         let bar = row![
-            tool_btn("+", "New", true, Message::NewDownload),
+            tool_btn("New", true, Message::NewDownload),
             divider(),
-            tool_btn("▶", "Resume", can_resume, Message::Resume(sel.unwrap_or(0))),
-            tool_btn("‖", "Pause", can_pause, Message::Pause(sel.unwrap_or(0))),
+            tool_btn("Resume", can_resume, Message::Resume(sel.unwrap_or(0))),
+            tool_btn("Pause", can_pause, Message::Pause(sel.unwrap_or(0))),
             divider(),
-            tool_btn("✕", "Remove", can_target, Message::Remove(sel.unwrap_or(0))),
-            tool_btn("⌂", "Folder", can_target, Message::OpenFolder(sel.unwrap_or(0))),
+            tool_btn("Remove", can_target, Message::Remove(sel.unwrap_or(0))),
+            tool_btn("Folder", can_target, Message::OpenFolder(sel.unwrap_or(0))),
         ]
         .padding([6, 10])
         .spacing(2)
@@ -645,6 +745,7 @@ impl Gui {
         };
 
         let (status_label, status_color) = match item.state {
+            State::Running if item.external => ("Downloading (ext)", palette::ACCENT),
             State::Running => ("Downloading", palette::ACCENT),
             State::Paused => ("Paused", palette::AMBER),
             State::Finished => ("Completed", palette::GREEN),
@@ -658,12 +759,9 @@ impl Gui {
             State::Failed => palette::RED,
         };
 
-        let speed_text = if item.state == State::Running {
-            fmt_speed(item.speed_bps)
-        } else {
-            String::new()
-        };
-        let eta = if item.state == State::Running {
+        let live = item.state == State::Running && !item.external;
+        let speed_text = if live { fmt_speed(item.speed_bps) } else { String::new() };
+        let eta = if live {
             item.progress
                 .total
                 .and_then(|total| eta_text(item.progress.downloaded, total, item.speed_bps))
@@ -897,19 +995,10 @@ impl Gui {
     }
 }
 
-/// Toolbar button: symbol over label, grayed out when disabled.
-fn tool_btn(
-    symbol: &'static str,
-    label: &'static str,
-    enabled: bool,
-    msg: Message,
-) -> Element<'static, Message> {
-    let content = column![text(symbol).size(16), text(label).size(10)]
-        .spacing(2)
-        .align_x(Alignment::Center);
-
-    button(container(content).width(62).padding([4, 0]))
-        .padding(0)
+/// Toolbar button: plain text label, grayed out when disabled.
+fn tool_btn(label: &'static str, enabled: bool, msg: Message) -> Element<'static, Message> {
+    button(text(label).size(13))
+        .padding([6, 14])
         .on_press_maybe(enabled.then_some(msg))
         .style(move |_: &Theme, status| {
             let bg = match status {
@@ -967,6 +1056,28 @@ fn filename_from_url(url: &str) -> String {
     } else {
         name.to_owned()
     }
+}
+
+/// The default directory watched for engine state files.
+fn downloads_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_owned())).join("Downloads")
+}
+
+/// Strips `.{name}.xdm-state.json` down to `{name}`; `None` for other files.
+fn state_file_base(file_name: &str) -> Option<&str> {
+    let rest = file_name.strip_prefix('.')?;
+    let base = rest.strip_suffix(".xdm-state.json")?;
+    (!base.is_empty()).then_some(base)
+}
+
+/// Path of the state file for a destination name within `dir`.
+fn state_file_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(".{name}.xdm-state.json"))
+}
+
+/// A state file modified within the last 10 s counts as actively downloading.
+fn is_fresh(modified: SystemTime) -> Option<bool> {
+    modified.elapsed().ok().map(|age| age < Duration::from_secs(10))
 }
 
 #[cfg(test)]
@@ -1035,5 +1146,23 @@ mod tests {
         assert_eq!(eta_text(0, 100, 10.0), Some("10s".to_owned()));
         assert_eq!(eta_text(0, 100, 0.0), None);
         assert_eq!(eta_text(100, 100, 10.0), None);
+    }
+
+    #[test]
+    fn state_file_names_round_trip() {
+        assert_eq!(state_file_base(".file.zip.xdm-state.json"), Some("file.zip"));
+        assert_eq!(
+            state_file_base(".%5BSPSX%5D-x.pkg.xdm-state.json"),
+            Some("%5BSPSX%5D-x.pkg")
+        );
+        assert_eq!(state_file_base("plain.txt"), None);
+        assert_eq!(state_file_base(".xdm-state.json"), None);
+    }
+
+    #[test]
+    fn fresh_means_recently_modified() {
+        let now = SystemTime::now();
+        assert_eq!(is_fresh(now - Duration::from_secs(1)), Some(true));
+        assert_eq!(is_fresh(now - Duration::from_secs(60)), Some(false));
     }
 }
