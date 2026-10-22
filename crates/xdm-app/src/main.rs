@@ -4,6 +4,7 @@
 //! headless CLI slice exercising the engine directly.
 
 mod gui;
+mod monitor;
 
 use std::io::Write as _;
 use std::path::PathBuf;
