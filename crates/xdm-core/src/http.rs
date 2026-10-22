@@ -81,16 +81,94 @@ pub struct Progress {
     pub total: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadConfig {
     /// Maximum number of concurrent range connections.
     pub max_chunks: usize,
+    /// Extra request headers replayed on every request of this download
+    /// (cookies, referer, per-site user agent, ...). Captured browser
+    /// requests need them to authorize the replayed download. See
+    /// [`is_blocked_header`] for what never leaves a capture.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 impl Default for DownloadConfig {
     fn default() -> Self {
-        Self { max_chunks: 8 }
+        Self { max_chunks: 8, headers: Vec::new() }
     }
+}
+
+/// Builds a client that replays `headers` on every request. A replayed
+/// `user-agent` takes precedence over the engine default. Both the segmented
+/// and the streaming downloaders share this so a captured browser request
+/// (cookies, referer, per-site UA) authorizes every connection we open.
+pub fn build_client_with_headers(headers: &[(String, String)]) -> Result<Client, DownloadError> {
+    build_client(headers, Client::builder())
+}
+
+/// Header names that must never be replayed from a captured browser request
+/// (the v9 extension's `blockedHeaders` list). Some would corrupt the engine's
+/// own request shape (`range` collides with the resumed offset, `accept` with
+/// the CDN probing), the rest are hop-by-hop or describe the *response*
+/// body/encoding rather than ours. `cookie` is deliberately NOT blocked: the
+/// monitor composes `Cookie` itself (once, from the message's separate field)
+/// and needs to pass it through here.
+pub fn is_blocked_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    if name.starts_with("if-") || name.starts_with("proxy-") {
+        return true;
+    }
+    matches!(
+        name.as_str(),
+        "accept"
+            | "connection"
+            | "expect"
+            | "te"
+            | "upgrade"
+            | "range"
+            | "transfer-encoding"
+            | "content-type"
+            | "content-length"
+            | "content-encoding"
+            | "accept-encoding"
+    )
+}
+
+/// Builds a client that replays `headers` on every request. A replayed
+/// `user-agent` takes precedence over the engine default.
+fn build_client(
+    headers: &[(String, String)],
+    client_builder: reqwest::ClientBuilder,
+) -> Result<Client, DownloadError> {
+    let mut builder = client_builder;
+    let mut map = reqwest::header::HeaderMap::new();
+    let mut explicit_ua = false;
+    for (name, value) in headers {
+        if is_blocked_header(name) {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("user-agent") {
+            explicit_ua = true;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            map.append(name, value);
+        } else {
+            tracing::debug!(header = name, "dropping non-ASCII replay header");
+        }
+    }
+    if !explicit_ua {
+        builder = builder.user_agent(USER_AGENT);
+    }
+    builder
+        .default_headers(map)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        .map_err(DownloadError::Http)
 }
 
 /// Persisted resume state for one download, written atomically
@@ -103,6 +181,11 @@ pub struct DownloadState {
     pub last_modified: Option<String>,
     pub accept_ranges: bool,
     pub chunks: Vec<ChunkState>,
+    /// Captured request headers (`DownloadConfig::headers`) so a download
+    /// resumed in a new process still authorizes itself. Old state files
+    /// decode with an empty list.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,12 +287,7 @@ impl HttpDownload {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(state_name);
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            .map_err(DownloadError::Http)?;
+        let client = build_client_with_headers(&config.headers)?;
         Ok(Self {
             client,
             url: url.into(),
@@ -250,7 +328,22 @@ impl HttpDownload {
         progress: &watch::Sender<Progress>,
     ) -> Result<Option<u64>, DownloadError> {
         let saved = self.load_state().await;
-        let probe = self.probe(saved.as_ref()).await?;
+        // Replaying captures: this run's config headers win; a resume after a
+        // process restart falls back to the headers persisted in the state
+        // file (the GUI passes no config headers for restored rows).
+        let effective_headers = if self.config.headers.is_empty() {
+            saved.as_ref().map(|s| s.headers.as_slice()).unwrap_or(&[])
+        } else {
+            &self.config.headers[..]
+        };
+        // Rebuild the client when the saved headers differ from the built-in
+        // one (fresh process resuming a captured download).
+        let client = if effective_headers == &self.config.headers[..] {
+            self.client.clone()
+        } else {
+            build_client_with_headers(effective_headers)?
+        };
+        let probe = self.probe(&client, saved.as_ref()).await?;
         if cancel.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
@@ -323,6 +416,7 @@ impl HttpDownload {
         let persister = {
             let state_path = self.state_path.clone();
             let url = self.url.clone();
+            let headers = effective_headers.to_vec();
             let etag = probe.etag.clone();
             let last_modified = probe.last_modified.clone();
             let total = probe.total;
@@ -338,14 +432,22 @@ impl HttpDownload {
                         _ = cancel_p.cancelled() => break,
                     }
                     let snapshot = snapshot_chunks(&chunks);
-                    let state = build_state(&url, total, &etag, &last_modified, accept_ranges, &snapshot);
+                    let state = build_state(
+                        &url,
+                        total,
+                        &etag,
+                        &last_modified,
+                        accept_ranges,
+                        &headers,
+                        &snapshot,
+                    );
                     save_state(&state_path, &state).await;
                 }
             })
         };
 
         let ctx = RunCtx {
-            client: self.client.clone(),
+            client,
             url: self.url.clone(),
             dest: self.dest.clone(),
             accept_ranges: probe.accept_ranges,
@@ -490,6 +592,7 @@ impl HttpDownload {
                     &probe.etag,
                     &probe.last_modified,
                     probe.accept_ranges,
+                    effective_headers,
                     &snapshot,
                 );
                 save_state(&self.state_path, &state).await;
@@ -506,8 +609,12 @@ impl HttpDownload {
     }
 
     /// One tiny range request to learn range support, total size, validator.
-    async fn probe(&self, saved: Option<&DownloadState>) -> Result<ProbeInfo, DownloadError> {
-        let mut req = self.client.get(&self.url).header(RANGE, "bytes=0-0");
+    async fn probe(
+        &self,
+        client: &Client,
+        saved: Option<&DownloadState>,
+    ) -> Result<ProbeInfo, DownloadError> {
+        let mut req = client.get(&self.url).header(RANGE, "bytes=0-0");
         if let Some(saved) = saved
             && let Some(v) = saved.etag.as_deref().or(saved.last_modified.as_deref())
         {
@@ -616,6 +723,7 @@ fn build_state(
     etag: &Option<String>,
     last_modified: &Option<String>,
     accept_ranges: bool,
+    headers: &[(String, String)],
     chunks: &[ChunkState],
 ) -> DownloadState {
     DownloadState {
@@ -625,6 +733,7 @@ fn build_state(
         last_modified: last_modified.clone(),
         accept_ranges,
         chunks: chunks.to_vec(),
+        headers: headers.to_vec(),
     }
 }
 
@@ -868,5 +977,35 @@ mod tests {
         assert_eq!(parse_content_range_total("bytes 0-0/12345"), Some(12345));
         assert_eq!(parse_content_range_total("bytes 0-0/*"), None);
         assert_eq!(parse_content_range_total("garbage"), None);
+    }
+
+    #[test]
+    fn blocked_headers_match_the_v9_extension_list() {
+        // Hop-by-hop / response-descriptive / engine-owned must never replay.
+        for name in [
+            "accept",
+            "Connection",
+            "EXPECT",
+            "te",
+            "upgrade",
+            "Range",
+            "transfer-encoding",
+            "Content-Type",
+            "content-length",
+            "Content-Encoding",
+            "Accept-Encoding",
+        ] {
+            assert!(is_blocked_header(name), "{name} must be blocked");
+        }
+        // Whole header families: conditionals and proxy hops.
+        for name in ["If-None-Match", "If-Modified-Since", "Proxy-Authorization"] {
+            assert!(is_blocked_header(name), "{name} must be blocked");
+        }
+        // Cookie passes through (the monitor composes it once, itself).
+        assert!(!is_blocked_header("Cookie"));
+        // Everything a download legitimately needs replays.
+        for name in ["User-Agent", "Referer", "Origin", "Authorization", "Accept-Language"] {
+            assert!(!is_blocked_header(name), "{name} must replay");
+        }
     }
 }

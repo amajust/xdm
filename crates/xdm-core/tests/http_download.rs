@@ -158,7 +158,7 @@ async fn multi_chunk_download_matches_source() {
     let dest = dir.join("file.bin");
 
     let (tx, _rx) = tokio::sync::watch::channel(Default::default());
-    let dl = HttpDownload::with_config(&url, &dest, DownloadConfig { max_chunks: 4 }).unwrap();
+    let dl = HttpDownload::with_config(&url, &dest, DownloadConfig { max_chunks: 4, headers: Vec::new() }).unwrap();
     let total = dl.run(CancellationToken::new(), tx).await.unwrap();
 
     assert_eq!(total, Some(8 * MIB));
@@ -187,6 +187,7 @@ async fn resumes_from_saved_state_with_if_range() {
             ChunkState { start: 0, end: 2 * MIB - 1, downloaded: 1_500_000, done: false },
             ChunkState { start: 2 * MIB, end: 4 * MIB - 1, downloaded: 0, done: true },
         ],
+        headers: Vec::new(),
     };
     std::fs::write(state_path(&dest), serde_json::to_vec(&state).unwrap()).unwrap();
 
@@ -231,7 +232,7 @@ async fn cancel_persists_state_for_resume() {
 
     let cancel = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::watch::channel(Default::default());
-    let dl = HttpDownload::with_config(&url, &dest, DownloadConfig { max_chunks: 2 }).unwrap();
+    let dl = HttpDownload::with_config(&url, &dest, DownloadConfig { max_chunks: 2, headers: Vec::new() }).unwrap();
     let run_cancel = cancel.clone();
     let handle = tokio::spawn(async move { dl.run(run_cancel, tx).await });
 
@@ -271,6 +272,7 @@ async fn stale_validator_restarts_automatically() {
         last_modified: None,
         accept_ranges: true,
         chunks: vec![ChunkState { start: 0, end: MIB - 1, downloaded: 100, done: false }],
+        headers: Vec::new(),
     };
     std::fs::write(state_path(&dest), serde_json::to_vec(&state).unwrap()).unwrap();
 
@@ -295,7 +297,7 @@ async fn stalled_connection_tail_is_stolen_and_download_completes() {
     let dest = dir.join("file.bin");
 
     let (tx, _rx) = tokio::sync::watch::channel(Default::default());
-    let dl = HttpDownload::with_config(&url, &dest, DownloadConfig { max_chunks: 8 }).unwrap();
+    let dl = HttpDownload::with_config(&url, &dest, DownloadConfig { max_chunks: 8, headers: Vec::new() }).unwrap();
     let total = dl.run(CancellationToken::new(), tx).await.unwrap();
 
     assert_eq!(total, Some(10 * MIB));
