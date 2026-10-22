@@ -16,7 +16,7 @@ use iced::widget::{
     button, column, container, mouse_area, progress_bar, rule, row, scrollable, space::Space,
     stack, text, text_input,
 };
-use iced::window::{Id, Mode};
+use iced::window::Id;
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -191,6 +191,18 @@ fn rt() -> &'static tokio::runtime::Runtime {
     RT.get_or_init(|| tokio::runtime::Runtime::new().expect("tokio runtime"))
 }
 
+/// Window settings shared by every window this app opens (initial and
+/// tray-restored). `exit_on_close_request` is disabled: the close button
+/// routes a close *request* to the app, which asks whether to minimize to
+/// the tray instead of exiting with no trace.
+fn window_settings() -> iced::window::Settings {
+    iced::window::Settings {
+        size: (1020, 640).into(),
+        exit_on_close_request: false,
+        ..iced::window::Settings::default()
+    }
+}
+
 pub fn run() -> iced::Result {
     // The tray service lives on the shared tokio runtime; its callbacks only
     // push commands into a static slot that the GUI tick polls, so a tray
@@ -201,18 +213,24 @@ pub fn run() -> iced::Result {
             Err(e) => eprintln!("xdm-app: system tray unavailable: {e:?}"),
         }
     });
-    iced::application(Gui::default, Gui::update, Gui::view)
-        .title(|_: &Gui| "Xtreme Download Manager Rust".to_owned())
-        .window(iced::window::Settings {
-            size: (1020, 640).into(),
-            // The close button is intercepted: we ask whether to minimize to
-            // the tray instead of leaving without notice.
-            exit_on_close_request: false,
-            ..iced::window::Settings::default()
-        })
+
+    // A daemon rather than an application: the window is just a view of the
+    // running state and can be closed entirely while minimized to the tray
+    // (engine tasks are tokio tasks of the same process, not the window).
+    // winit cannot hide windows on Wayland, so "minimize to tray" destroys
+    // the window and the tray restores a fresh one on demand.
+    iced::daemon(boot, Gui::update, Gui::view)
+        .title(|_: &Gui, _: Id| "Xtreme Download Manager Rust".to_owned())
         .subscription(Gui::subscription)
-        .theme(|_: &Gui| Theme::Light)
+        .theme(|_: &Gui, _: Id| Theme::Light)
         .run()
+}
+
+/// Daemon boot: the initial state plus the task opening the first window,
+/// which reports the window id as a [`Message::GotWindowId`] on completion.
+fn boot() -> (Gui, Task<Message>) {
+    let (id, opened) = iced::window::open(window_settings());
+    (Gui::default(), opened.map(move |_| Message::GotWindowId(Some(id))))
 }
 
 #[derive(Debug, Clone)]
@@ -621,9 +639,20 @@ impl Gui {
                 tasks.extend(tray::take_command().map(|cmd| match cmd {
                     tray::TrayCmd::Show => {
                         self.confirm_quit = false;
-                        self.window_id
-                            .map(|id| iced::window::set_mode(id, Mode::Windowed))
-                            .unwrap_or_else(Task::none)
+                        match self.window_id {
+                            // Already have a window (dialog open or window
+                            // unused): just raise it, never open a duplicate.
+                            Some(id) => iced::window::gain_focus(id),
+                            // Tray-minimized: no window exists; restore one.
+                            None => {
+                                let (id, opened) =
+                                    iced::window::open(window_settings());
+                                // The id is assigned up front, so it is
+                                // known before the open future completes.
+                                self.window_id = Some(id);
+                                opened.map(move |_| Message::GotWindowId(Some(id)))
+                            }
+                        }
                     }
                     tray::TrayCmd::Quit => {
                         self.persist();
@@ -651,9 +680,16 @@ impl Gui {
             }
             Message::HideToTray => {
                 self.confirm_quit = false;
-                self.window_id
-                    .map(|id| iced::window::set_mode(id, Mode::Hidden))
-                    .unwrap_or_else(Task::none)
+                match self.window_id.take() {
+                    // winit has no Wayland hide; destroying the window *is*
+                    // the tray-minimized state: no taskbar entry, everything
+                    // keeps running (subscriptions are daemon-level).
+                    Some(id) => {
+                        self.persist();
+                        iced::window::close(id)
+                    }
+                    None => Task::none(),
+                }
             }
             Message::Quit => {
                 self.persist();
@@ -777,16 +813,11 @@ impl Gui {
         });
     }
 
-    /// Actually exits the application: `window::close` terminates the process
-    /// (bypassing the close-request interception, which would otherwise pop
-    /// the dialog again). Abrupt engine shutdown is safe — the state file
-    /// survives and the download resumes on the next launch.
+    /// Actually exits the application: `iced::exit` terminates the daemon
+    /// runtime (and with it any open window). Abrupt engine shutdown is safe
+    /// — the state file survives and the download resumes on the next launch.
     fn quit_task(&self) -> Task<Message> {
-        self.window_id
-            .map(iced::window::close)
-            .unwrap_or_else(|| {
-                std::process::exit(0);
-            })
+        iced::exit()
     }
 
     fn refresh(&mut self) -> Option<Task<Message>> {
@@ -974,7 +1005,8 @@ impl Gui {
             .count()
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    /// Daemon view: one window at a time, `id` is irrelevant (same UI).
+    fn view(&self, _id: Id) -> Element<'_, Message> {
         let layout = column![
             self.toolbar(),
             row![self.sidebar(), self.content()]
