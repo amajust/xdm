@@ -22,6 +22,14 @@ use tokio_util::sync::CancellationToken;
 use xdm_core::engine::download;
 use xdm_core::http::{DownloadConfig, DownloadError, DownloadState, Progress};
 
+/// How often a failed download is re-spawned automatically before giving up.
+const MAX_AUTO_RETRIES: u32 = 8;
+
+/// Backoff before auto-retry attempt `n` (1-based): 2 s, 4 s, … capped at 30 s.
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(u64::from(2 * attempt)).min(Duration::from_secs(30))
+}
+
 /// Material palette close to the Java XDM look.
 mod palette {
     use iced::Color;
@@ -77,6 +85,7 @@ pub enum Message {
     Resume(usize),
     Remove(usize),
     OpenFolder(usize),
+    AutoRetry(usize),
 }
 
 /// Engine-side status, mirrored through the shared `AtomicU8`.
@@ -239,6 +248,10 @@ struct DownloadItem {
     last_tick: Option<Instant>,
     /// Driven by another process (e.g. the CLI); only observed, not controlled.
     external: bool,
+    /// Consecutive engine failures without progress (auto-retry budget).
+    retry_count: u32,
+    /// A retry task is pending; prevents stacking one retry per tick.
+    retry_scheduled: bool,
 }
 
 #[derive(Default)]
@@ -278,6 +291,23 @@ impl Gui {
                     return Task::none();
                 }
                 let dest = destination(&url, &self.dest);
+                // Re-adding an existing destination resumes that row instead
+                // of spawning a second engine on the same files.
+                if let Some(pos) = self.downloads.iter().position(|it| it.dest == dest) {
+                    let running = self.downloads[pos].state == State::Running;
+                    self.selected = Some(pos);
+                    self.modal_open = false;
+                    self.url.clear();
+                    if !running {
+                        if let Some(item) = self.downloads.get_mut(pos) {
+                            item.external = false;
+                            item.retry_count = 0;
+                            item.retry_scheduled = false;
+                        }
+                        self.spawn_run(pos, CancellationToken::new());
+                    }
+                    return Task::none();
+                }
                 let name = dest
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -296,12 +326,12 @@ impl Gui {
                 Task::none()
             }
             Message::Tick => {
-                self.refresh();
+                let retry = self.refresh();
                 self.scan_counter = self.scan_counter.wrapping_add(1);
                 if self.scan_counter % 8 == 1 {
                     self.scan_state_files();
                 }
-                Task::none()
+                retry.unwrap_or_else(Task::none)
             }
             Message::Select(i) => {
                 self.selected = Some(i);
@@ -314,11 +344,13 @@ impl Gui {
             Message::Pause(i) => {
                 // An external download is driven by another process; we can
                 // only observe it, not pause it.
-                if let Some(item) = self.downloads.get(i)
+                if let Some(item) = self.downloads.get_mut(i)
                     && !item.external
-                    && let Some(cancel) = &item.cancel
                 {
-                    cancel.cancel();
+                    if let Some(cancel) = &item.cancel {
+                        cancel.cancel();
+                    }
+                    item.retry_scheduled = false;
                 }
                 Task::none()
             }
@@ -330,6 +362,8 @@ impl Gui {
                 if !running {
                     if let Some(item) = self.downloads.get_mut(i) {
                         item.external = false;
+                        item.retry_count = 0;
+                        item.retry_scheduled = false;
                     }
                     self.spawn_run(i, CancellationToken::new());
                 }
@@ -360,6 +394,15 @@ impl Gui {
                             .status()
                             .await;
                     });
+                }
+                Task::none()
+            }
+            Message::AutoRetry(i) => {
+                if let Some(item) = self.downloads.get_mut(i)
+                    && item.retry_scheduled
+                {
+                    item.retry_scheduled = false;
+                    self.spawn_run(i, CancellationToken::new());
                 }
                 Task::none()
             }
@@ -400,8 +443,9 @@ impl Gui {
         });
     }
 
-    fn refresh(&mut self) {
-        for item in &mut self.downloads {
+    fn refresh(&mut self) -> Option<Task<Message>> {
+        let mut scheduled: Option<Task<Message>> = None;
+        for (i, item) in self.downloads.iter_mut().enumerate() {
             if let Some(rx) = item.rx_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
                 item.progress = *rx.borrow();
             }
@@ -417,6 +461,10 @@ impl Gui {
 
             let now = Instant::now();
             if item.state == State::Running && !item.external {
+                // Making progress: the auto-retry budget resets.
+                if item.progress.downloaded > item.prev_downloaded {
+                    item.retry_count = 0;
+                }
                 match item.last_tick {
                     Some(last) => {
                         let dt = now.duration_since(last).as_secs_f64();
@@ -441,7 +489,25 @@ impl Gui {
                 item.prev_downloaded = item.progress.downloaded;
                 item.last_tick = Some(now);
             }
+
+            // Auto-retry unexpected engine failures with backoff (XDM-style
+            // self-healing). User pauses and externally-driven rows are left
+            // alone.
+            if item.state == State::Failed
+                && !item.external
+                && !item.retry_scheduled
+                && item.retry_count < MAX_AUTO_RETRIES
+            {
+                item.retry_count += 1;
+                item.retry_scheduled = true;
+                let attempt = item.retry_count;
+                scheduled = Some(Task::perform(
+                    tokio::time::sleep(retry_delay(attempt)),
+                    move |_| Message::AutoRetry(i),
+                ));
+            }
         }
+        scheduled
     }
 
     /// Watches the downloads directory for engine state files written by other
@@ -744,18 +810,24 @@ impl Gui {
             None => format!("{} downloaded", fmt_size(item.progress.downloaded)),
         };
 
+        let retrying = item.state == State::Failed && !item.external && item.retry_scheduled;
         let (status_label, status_color) = match item.state {
-            State::Running if item.external => ("Downloading (ext)", palette::ACCENT),
-            State::Running => ("Downloading", palette::ACCENT),
-            State::Paused => ("Paused", palette::AMBER),
-            State::Finished => ("Completed", palette::GREEN),
-            State::Failed => ("Failed", palette::RED),
+            State::Running if item.external => ("Downloading (ext)".to_owned(), palette::ACCENT),
+            State::Running => ("Downloading".to_owned(), palette::ACCENT),
+            State::Paused => ("Paused".to_owned(), palette::AMBER),
+            State::Finished => ("Completed".to_owned(), palette::GREEN),
+            State::Failed if retrying => (
+                format!("Retrying ({}/{}…)", item.retry_count, MAX_AUTO_RETRIES),
+                palette::AMBER,
+            ),
+            State::Failed => ("Failed".to_owned(), palette::RED),
         };
 
         let bar_color = match item.state {
             State::Running => palette::ACCENT,
             State::Paused => palette::AMBER,
             State::Finished => palette::GREEN,
+            State::Failed if retrying => palette::AMBER,
             State::Failed => palette::RED,
         };
 
@@ -822,6 +894,7 @@ impl Gui {
         .width(Length::Fill);
 
         if item.state == State::Failed
+            && !retrying
             && let Some(err) = &item.error_text
         {
             info = info.push(text(err.as_str()).size(11).color(palette::RED));
@@ -1164,5 +1237,12 @@ mod tests {
         let now = SystemTime::now();
         assert_eq!(is_fresh(now - Duration::from_secs(1)), Some(true));
         assert_eq!(is_fresh(now - Duration::from_secs(60)), Some(false));
+    }
+
+    #[test]
+    fn retry_backoff_grows_and_caps() {
+        assert_eq!(retry_delay(1), Duration::from_secs(2));
+        assert_eq!(retry_delay(4), Duration::from_secs(8));
+        assert_eq!(retry_delay(20), Duration::from_secs(30));
     }
 }
