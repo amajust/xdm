@@ -28,3 +28,4 @@ hs_err_pid27504.log
 
 # Rust
 /target/
+.opencode/
