@@ -16,6 +16,7 @@ use iced::widget::{
     button, column, container, mouse_area, progress_bar, rule, row, scrollable, space::Space,
     stack, text, text_input,
 };
+use iced::window::{Id, Mode};
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +62,127 @@ mod palette {
     pub const WHITE: Color = Color::from_rgb8(0xFF, 0xFF, 0xFF);
 }
 
+/// System tray integration (StatusNotifierItem, native to KDE Plasma).
+///
+/// The tray lives on the shared tokio runtime; callbacks push commands into a
+/// static slot which the GUI tick drains ([`tray::take_command`]). Keeping the
+/// link one-directional avoids any blocking call on either side.
+mod tray {
+    use ksni::menu::StandardItem;
+    use ksni::{Icon, MenuItem, ToolTip, Tray};
+    use std::sync::{Mutex, OnceLock};
+
+    pub const APP_ID: &str = "xdm-app";
+
+    /// One-shot mailbox between tray callbacks and the GUI tick.
+    #[derive(Debug, Clone, Copy)]
+    pub enum TrayCmd {
+        Show,
+        Quit,
+    }
+
+    fn slot() -> &'static Mutex<Option<TrayCmd>> {
+        static SLOT: OnceLock<Mutex<Option<TrayCmd>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    fn push(cmd: TrayCmd) {
+        let mut guard = slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(cmd);
+    }
+
+    pub fn take_command() -> Option<TrayCmd> {
+        slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    pub struct TrayState;
+
+    impl Tray for TrayState {
+        fn id(&self) -> String {
+            APP_ID.to_owned()
+        }
+
+        fn title(&self) -> String {
+            "Xtreme Download Manager Rust".to_owned()
+        }
+
+        fn tool_tip(&self) -> ToolTip {
+            ToolTip {
+                icon_name: String::new(),
+                icon_pixmap: Vec::new(),
+                title: self.title(),
+                description: "Download manager running in the background".to_owned(),
+            }
+        }
+
+        fn activate(&mut self, _x: i32, _y: i32) {
+            push(TrayCmd::Show);
+        }
+
+        fn icon_pixmap(&self) -> Vec<Icon> {
+            vec![icon()]
+        }
+
+        fn menu(&self) -> Vec<MenuItem<Self>> {
+            vec![
+                StandardItem {
+                    label: "Show Window".to_owned(),
+                    activate: Box::new(|_| push(TrayCmd::Show)),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                StandardItem {
+                    label: "Quit".to_owned(),
+                    activate: Box::new(|_| push(TrayCmd::Quit)),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+        }
+    }
+
+    /// The tray icon: a dark XDM disc with the cyan download arrow.
+    pub fn icon() -> Icon {
+        const S: i32 = 32;
+        let mut data = Vec::with_capacity((S * S * 4) as usize);
+        for y in 0..S {
+            for x in 0..S {
+                let (a, r, g, b) = pixel(x as f32, y as f32);
+                data.extend_from_slice(&[a, r, g, b]);
+            }
+        }
+        Icon {
+            width: S,
+            height: S,
+            data,
+        }
+    }
+
+    /// One pixel of [`icon`], as ARGB32 components (alpha, red, green, blue).
+    fn pixel(x: f32, y: f32) -> (u8, u8, u8, u8) {
+        let transparent = || (0u8, 0u8, 0u8, 0u8);
+        // Dark disc (toolbar color), slightly inset for the tray mask.
+        let dx = x - 15.5;
+        let dy = y - 15.5;
+        if dx * dx + dy * dy > 14.5 * 14.5 {
+            return transparent();
+        }
+        // Cyan download arrow: triangle tapering downward from y 8 to the
+        // apex at y 18, then a stem to y 24 (both centered on x 16.5).
+        let arrowhead = (8.0..18.0).contains(&y) && (x - 16.5).abs() <= 7.5 * ((18.0 - y) / 10.0);
+        let stem = (18.0..24.0).contains(&y) && (x - 16.5).abs() <= 5.5;
+        if arrowhead || stem {
+            (255, 0x33, 0xB5, 0xE5)
+        } else {
+            (255, 0x0E, 0x14, 0x19)
+        }
+    }
+}
+
 /// The engine needs a real tokio runtime (tokio::fs, tokio::spawn, timers);
 /// iced's own executor does not provide one, so we own it explicitly.
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -70,10 +192,22 @@ fn rt() -> &'static tokio::runtime::Runtime {
 }
 
 pub fn run() -> iced::Result {
+    // The tray service lives on the shared tokio runtime; its callbacks only
+    // push commands into a static slot that the GUI tick polls, so a tray
+    // activation can never block the D-Bus menu thread on UI work.
+    rt().spawn(async {
+        match ksni::TrayMethods::spawn(tray::TrayState).await {
+            Ok(handle) => std::mem::forget(handle),
+            Err(e) => eprintln!("xdm-app: system tray unavailable: {e:?}"),
+        }
+    });
     iced::application(Gui::default, Gui::update, Gui::view)
-        .title(|_: &Gui| "Xtreme Download Manager".to_owned())
+        .title(|_: &Gui| "Xtreme Download Manager Rust".to_owned())
         .window(iced::window::Settings {
             size: (1020, 640).into(),
+            // The close button is intercepted: we ask whether to minimize to
+            // the tray instead of leaving without notice.
+            exit_on_close_request: false,
             ..iced::window::Settings::default()
         })
         .subscription(Gui::subscription)
@@ -96,6 +230,16 @@ pub enum Message {
     Remove(usize),
     OpenFolder(usize),
     AutoRetry(usize),
+    /// Result of the first-tick `window::latest()` lookup.
+    GotWindowId(Option<Id>),
+    /// The window manager delivered a close request (X button).
+    WinClose,
+    /// Close dialog: keep running hidden in the tray.
+    HideToTray,
+    /// Close dialog: really quit.
+    Quit,
+    /// Close dialog dismissed without choosing (backdrop / cancel).
+    CancelQuit,
 }
 
 /// Engine-side status, mirrored through the shared `AtomicU8`.
@@ -315,6 +459,10 @@ struct Gui {
     /// Destinations removed by the user; hidden from the state-file scanner
     /// until their engine state files disappear.
     removed: std::collections::HashSet<String>,
+    /// Main window id, captured on the first tick; needed for tray commands.
+    window_id: Option<Id>,
+    /// The close button was pressed; show the minimize-to-tray dialog.
+    confirm_quit: bool,
 }
 
 impl Default for Gui {
@@ -332,6 +480,8 @@ impl Default for Gui {
                 modal_open: false,
                 scan_counter: 0,
                 removed: std::collections::HashSet::new(),
+                window_id: None,
+                confirm_quit: false,
             };
         };
         let downloads = restore_downloads(&list);
@@ -345,6 +495,8 @@ impl Default for Gui {
             modal_open: false,
             scan_counter: 0,
             removed,
+            window_id: None,
+            confirm_quit: false,
         }
     }
 }
@@ -459,12 +611,57 @@ impl Gui {
                 Task::none()
             }
             Message::Tick => {
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                // The main window id is needed for any tray command; capture
+                // it once instead of carrying an id through every message.
+                if self.window_id.is_none() {
+                    tasks.push(iced::window::latest().map(Message::GotWindowId));
+                }
+                // Tray requests (window show, quit) arrive out of band.
+                tasks.extend(tray::take_command().map(|cmd| match cmd {
+                    tray::TrayCmd::Show => {
+                        self.confirm_quit = false;
+                        self.window_id
+                            .map(|id| iced::window::set_mode(id, Mode::Windowed))
+                            .unwrap_or_else(Task::none)
+                    }
+                    tray::TrayCmd::Quit => {
+                        self.persist();
+                        self.quit_task()
+                    }
+                }));
                 let retry = self.refresh();
                 self.scan_counter = self.scan_counter.wrapping_add(1);
                 if self.scan_counter % 8 == 1 {
                     self.scan_state_files();
                 }
-                retry.unwrap_or_else(Task::none)
+                if let Some(retry) = retry {
+                    tasks.push(retry);
+                }
+                Task::batch(tasks)
+            }
+            Message::GotWindowId(id) => {
+                self.window_id = id;
+                Task::none()
+            }
+            Message::WinClose => {
+                // X button pressed: ask before leaving (XDM-style close dialog).
+                self.confirm_quit = true;
+                Task::none()
+            }
+            Message::HideToTray => {
+                self.confirm_quit = false;
+                self.window_id
+                    .map(|id| iced::window::set_mode(id, Mode::Hidden))
+                    .unwrap_or_else(Task::none)
+            }
+            Message::Quit => {
+                self.persist();
+                self.quit_task()
+            }
+            Message::CancelQuit => {
+                self.confirm_quit = false;
+                Task::none()
             }
             Message::Select(i) => {
                 self.selected = Some(i);
@@ -578,6 +775,18 @@ impl Gui {
                 }
             }
         });
+    }
+
+    /// Actually exits the application: `window::close` terminates the process
+    /// (bypassing the close-request interception, which would otherwise pop
+    /// the dialog again). Abrupt engine shutdown is safe — the state file
+    /// survives and the download resumes on the next launch.
+    fn quit_task(&self) -> Task<Message> {
+        self.window_id
+            .map(iced::window::close)
+            .unwrap_or_else(|| {
+                std::process::exit(0);
+            })
     }
 
     fn refresh(&mut self) -> Option<Task<Message>> {
@@ -776,8 +985,11 @@ impl Gui {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        if self.modal_open {
-            stack![layout, self.modal_backdrop(), self.modal_card()].into()
+        if self.confirm_quit {
+            stack![layout, self.modal_backdrop(Message::CancelQuit), self.quit_card()]
+                .into()
+        } else if self.modal_open {
+            stack![layout, self.modal_backdrop(Message::CancelModal), self.modal_card()].into()
         } else {
             layout.into()
         }
@@ -1178,7 +1390,7 @@ impl Gui {
         .into()
     }
 
-    fn modal_backdrop(&self) -> Element<'_, Message> {
+    fn modal_backdrop(&self, on_press: Message) -> Element<'_, Message> {
         mouse_area(
             container("")
                 .width(Length::Fill)
@@ -1188,7 +1400,75 @@ impl Gui {
                     ..container::Style::default()
                 }),
         )
-        .on_press(Message::CancelModal)
+        .on_press(on_press)
+        .into()
+    }
+
+    /// X-button close dialog: minimize to tray or really quit, XDM-style.
+    fn quit_card(&self) -> Element<'_, Message> {
+        container(
+            column![
+                text("Exit Xtreme Download Manager Rust?")
+                    .size(17)
+                    .color(palette::DIALOG_TEXT),
+                text("Keep running hidden in the tray, or quit completely?")
+                    .size(13)
+                    .color(palette::DIALOG_DIM),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Minimize to tray").size(13).color(palette::TEXT))
+                        .padding([7, 16])
+                        .style(|_: &Theme, _| button::Style {
+                            background: Some(palette::ACCENT.into()),
+                            text_color: palette::TEXT,
+                            border: iced::Border {
+                                color: Color::TRANSPARENT,
+                                width: 0.0,
+                                radius: 4.0.into(),
+                            },
+                            ..button::Style::default()
+                        })
+                        .on_press(Message::HideToTray),
+                    button(text("Quit").size(13).color(palette::DIALOG_TEXT))
+                        .padding([7, 16])
+                        .style(|_: &Theme, status| {
+                            let bg = matches!(status, button::Status::Hovered)
+                                .then_some(palette::DIALOG_BORDER)
+                                .map(iced::Background::from);
+                            button::Style {
+                                background: bg,
+                                text_color: palette::DIALOG_TEXT,
+                                border: iced::Border {
+                                    color: palette::DIALOG_BORDER,
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
+                                ..button::Style::default()
+                            }
+                        })
+                        .on_press(Message::Quit),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(12),
+        )
+        .width(460)
+        .padding(22)
+        .style(|_| container::Style {
+            background: Some(palette::DIALOG_BG.into()),
+            border: iced::Border {
+                color: palette::DIALOG_BORDER,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
+                offset: iced::Vector::new(0.0, 6.0),
+                blur_radius: 24.0,
+            },
+            ..container::Style::default()
+        })
         .into()
     }
 
@@ -1278,7 +1558,12 @@ impl Gui {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
+            // Close requests (X button) as messages: exit_on_close_request is
+            // disabled, so the runtime forwards them to the app instead.
+            iced::window::close_requests().map(|_| Message::WinClose),
+        ])
     }
 }
 
@@ -1516,6 +1801,24 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(2));
         assert_eq!(retry_delay(4), Duration::from_secs(8));
         assert_eq!(retry_delay(20), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn tray_icon_is_arbg32_disc_with_arrow() {
+        let icon = tray::icon();
+        assert_eq!((icon.width, icon.height), (32, 32));
+        assert_eq!(icon.data.len(), 32 * 32 * 4);
+
+        // Pixel 0 (corner): outside the disc, fully transparent.
+        assert_eq!(&icon.data[..4], &[0, 0, 0, 0]);
+        // A disc point away from the arrow: dark background.
+        let bg = (5 * 4) + 16 * 4 * 32;
+        assert_eq!(&icon.data[bg..bg + 4], &[255, 0x0E, 0x14, 0x19]);
+        // Arrowhead pixel and stem pixel: cyan.
+        let arrow = (9 * 4) + 8 * 4 * 32;
+        assert_eq!(&icon.data[arrow..arrow + 4], &[255, 0x33, 0xB5, 0xE5]);
+        let stem = (12 * 4) + 20 * 4 * 32;
+        assert_eq!(&icon.data[stem..stem + 4], &[255, 0x33, 0xB5, 0xE5]);
     }
 
     #[test]
