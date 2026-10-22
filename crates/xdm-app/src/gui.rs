@@ -378,6 +378,13 @@ fn restore_downloads(list: &SavedList) -> Vec<DownloadItem> {
             } else {
                 State::Finished
             },
+            // Match the status atom to the restored state; the RUNNING default
+            // would render the row as an active download for the first tick.
+            status: Arc::new(AtomicU8::new(if state_file_exists && dest_exists {
+                st::PAUSED
+            } else {
+                st::FINISHED
+            })),
             external: true,
             ..DownloadItem::default()
         });
@@ -416,10 +423,14 @@ impl Gui {
                 // of spawning a second engine on the same files.
                 if let Some(pos) = self.downloads.iter().position(|it| it.dest == dest) {
                     let running = self.downloads[pos].state == State::Running;
+                    let finished = self.downloads[pos].state == State::Finished;
                     self.selected = Some(pos);
                     self.modal_open = false;
                     self.url.clear();
-                    if !running {
+                    // A finished download has no engine state left to resume:
+                    // spawning would wipe the file and re-download everything
+                    // from byte 0. Completed rows are left alone.
+                    if !running && !finished {
                         if let Some(item) = self.downloads.get_mut(pos) {
                             item.external = false;
                             item.retry_count = 0;
@@ -477,11 +488,11 @@ impl Gui {
                 Task::none()
             }
             Message::Resume(i) => {
-                let running = self
-                    .downloads
-                    .get(i)
-                    .is_some_and(|it| it.state == State::Running);
-                if !running {
+                // Only Paused/Failed rows can be resumed. A Finished row has no
+                // engine state left: spawning would re-download the whole file
+                // from byte 0 and overwrite the completed download.
+                let state = self.downloads.get(i).map(|it| it.state);
+                if matches!(state, Some(State::Paused) | Some(State::Failed)) {
                     if let Some(item) = self.downloads.get_mut(i) {
                         item.external = false;
                         item.retry_count = 0;
