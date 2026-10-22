@@ -30,21 +30,31 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(u64::from(2 * attempt)).min(Duration::from_secs(30))
 }
 
-/// Material palette close to the Java XDM look.
+/// Java XDM 7.2.11 look (ColorResource.java): white main area, a near-black
+/// toolbar band, Holo-cyan selection/progress accent, dark dialogs.
 mod palette {
     use iced::Color;
 
-    pub const SIDEBAR: Color = Color::from_rgb8(0x2B, 0x39, 0x45);
-    pub const SIDEBAR_HOVER: Color = Color::from_rgb8(0x36, 0x46, 0x54);
-    pub const ACCENT: Color = Color::from_rgb8(0x21, 0x96, 0xF3);
+    pub const TOOLBAR: Color = Color::from_rgb8(0x0E, 0x14, 0x19); // (14, 20, 25)
+    pub const TOOLBAR_HOVER: Color = Color::from_rgb8(105, 105, 105); // Color.DARK_GRAY
+    pub const TOOLBAR_PRESSED: Color = Color::from_rgb8(0x2B, 0x2B, 0x2B); // (43, 43, 43)
+    pub const SIDEBAR: Color = Color::from_rgb8(0xFF, 0xFF, 0xFF);
+    pub const SIDEBAR_HOVER: Color = Color::from_rgb8(0xF5, 0xF5, 0xF5);
+    pub const SIDEBAR_ACTIVE: Color = Color::from_rgb8(0xF2, 0xF2, 0xF2); // activeTabColor
+    pub const ACCENT: Color = Color::from_rgb8(0x33, 0xB5, 0xE5); // selectionColor
     pub const CARD: Color = Color::from_rgb8(0xFF, 0xFF, 0xFF);
-    pub const CARD_BORDER: Color = Color::from_rgb8(0xE4, 0xE7, 0xEB);
-    pub const CONTENT: Color = Color::from_rgb8(0xF4, 0xF5, 0xF7);
-    pub const ROW_SELECTED: Color = Color::from_rgb8(0xE3, 0xF2, 0xFD);
-    pub const TEXT: Color = Color::from_rgb8(0x21, 0x25, 0x29);
-    pub const TEXT_DIM: Color = Color::from_rgb8(0x6E, 0x76, 0x81);
-    pub const TEXT_DISABLED: Color = Color::from_rgb8(0xB6, 0xBC, 0xC4);
-    pub const TRACK: Color = Color::from_rgb8(0xE3, 0xE6, 0xEA);
+    pub const CARD_BORDER: Color = Color::from_rgb8(0xEB, 0xEB, 0xEB); // (235, 235, 235) lineLbl
+    pub const CONTENT: Color = Color::from_rgb8(0xFF, 0xFF, 0xFF);
+    pub const ROW_SELECTED: Color = Color::from_rgb8(0x33, 0xB5, 0xE5);
+    pub const TEXT: Color = Color::from_rgb8(0x00, 0x00, 0x00);
+    pub const TEXT_DIM: Color = Color::from_rgb8(0x3C, 0x3C, 0x3C);
+    pub const TEXT_DISABLED: Color = Color::from_rgb8(0xA0, 0xA0, 0xA0); // deepFontColor
+    pub const TRACK: Color = Color::from_rgb8(0x80, 0x80, 0x80); // Color.GRAY
+    pub const DIALOG_BG: Color = Color::from_rgb8(0x32, 0x32, 0x32); // darkerBgColor
+    pub const DIALOG_INPUT: Color = Color::from_rgb8(0x1E, 0x1E, 0x1E); // darkestBgColor
+    pub const DIALOG_BORDER: Color = Color::from_rgb8(0x49, 0x49, 0x49); // darkBgColor
+    pub const DIALOG_TEXT: Color = Color::from_rgb8(0xEB, 0xEB, 0xEB); // whiteColor
+    pub const DIALOG_DIM: Color = Color::from_rgb8(0xBE, 0xBE, 0xBE); // lightFontColor
     pub const GREEN: Color = Color::from_rgb8(0x43, 0xA0, 0x47);
     pub const AMBER: Color = Color::from_rgb8(0xFB, 0x8C, 0x00);
     pub const RED: Color = Color::from_rgb8(0xE5, 0x39, 0x35);
@@ -655,7 +665,7 @@ impl Gui {
 
         let divider = || {
             container("").width(1).height(22).style(|_| container::Style {
-                background: Some(palette::CARD_BORDER.into()),
+                background: Some(palette::DIALOG_BORDER.into()),
                 ..container::Style::default()
             })
         };
@@ -677,7 +687,7 @@ impl Gui {
             container(bar)
                 .width(Length::Fill)
                 .style(|_| container::Style {
-                    background: Some(palette::CARD.into()),
+                    background: Some(palette::TOOLBAR.into()),
                     ..container::Style::default()
                 }),
             rule::horizontal(1.0).style(|_| rule::Style {
@@ -741,7 +751,7 @@ impl Gui {
             .on_press(Message::Category(cat))
             .style(move |_: &Theme, status| {
                 let bg = if active {
-                    Some(palette::ACCENT.into())
+                    Some(palette::SIDEBAR_ACTIVE.into())
                 } else if matches!(status, button::Status::Hovered) {
                     Some(palette::SIDEBAR_HOVER.into())
                 } else {
@@ -749,7 +759,7 @@ impl Gui {
                 };
                 button::Style {
                     background: bg,
-                    text_color: palette::WHITE,
+                    text_color: palette::TEXT,
                     border: iced::Border {
                         color: Color::TRANSPARENT,
                         width: 0.0,
@@ -762,15 +772,33 @@ impl Gui {
     }
 
     fn content(&self) -> Element<'_, Message> {
-        let rows: Vec<Element<'_, Message>> = self
+        // Java XDM separates flat white rows with a 1 px hairline instead of
+        // spacing.
+        let mut stack: Vec<Element<'_, Message>> = Vec::new();
+        let visible: Vec<(usize, &DownloadItem)> = self
             .downloads
             .iter()
             .enumerate()
             .filter(|(_, it)| self.category_shows(it, self.category))
-            .map(|(i, it)| self.download_row(i, it))
             .collect();
+        let last = visible.len().saturating_sub(1);
+        for (pos, (i, it)) in visible.into_iter().enumerate() {
+            stack.push(self.download_row(i, it));
+            if pos != last {
+                stack.push(
+                    container("")
+                        .width(Length::Fill)
+                        .height(1)
+                        .style(|_| container::Style {
+                            background: Some(palette::CARD_BORDER.into()),
+                            ..container::Style::default()
+                        })
+                        .into(),
+                );
+            }
+        }
 
-        let body: Element<'_, Message> = if rows.is_empty() {
+        let body: Element<'_, Message> = if stack.is_empty() {
             container(
                 column![
                     text("Nothing here yet").size(16).color(palette::TEXT_DIM),
@@ -787,7 +815,7 @@ impl Gui {
             .into()
         } else {
             container(
-                scrollable(column(rows).spacing(10))
+                scrollable(column(stack))
                     .width(Length::Fill)
                     .height(Length::Fill),
             )
@@ -841,7 +869,8 @@ impl Gui {
         let bar_color = match item.state {
             State::Running => palette::ACCENT,
             State::Paused => palette::AMBER,
-            State::Finished => palette::GREEN,
+            // Java XDM paints progress bars in the cyan accent throughout.
+            State::Finished => palette::ACCENT,
             State::Failed if retrying => palette::AMBER,
             State::Failed => palette::RED,
         };
@@ -880,7 +909,13 @@ impl Gui {
         let mut info = column![
             text(item.name.as_str())
                 .size(14)
-                .color(palette::TEXT)
+                .color(
+                    if selected {
+                        palette::WHITE
+                    } else {
+                        palette::TEXT
+                    }
+                )
                 .font(Font {
                     weight: Weight::Semibold,
                     ..Font::default()
@@ -897,10 +932,28 @@ impl Gui {
             .height(6)
             .width(Length::Fill),
             row![
-                text(size_line).size(11).color(palette::TEXT_DIM),
+                text(size_line).size(11).color(
+                    if selected {
+                        palette::WHITE
+                    } else {
+                        palette::TEXT_DIM
+                    }
+                ),
                 Space::new().width(Length::Fill),
-                text(speed_text).size(11).color(palette::TEXT_DIM),
-                text(eta).size(11).color(palette::TEXT_DIM),
+                text(speed_text).size(11).color(
+                    if selected {
+                        palette::WHITE
+                    } else {
+                        palette::TEXT_DIM
+                    }
+                ),
+                text(eta).size(11).color(
+                    if selected {
+                        palette::WHITE
+                    } else {
+                        palette::TEXT_DIM
+                    }
+                ),
             ]
             .spacing(10)
             .width(Length::Fill),
@@ -915,10 +968,18 @@ impl Gui {
             info = info.push(text(err.as_str()).size(11).color(palette::RED));
         }
 
-        let side = column![text(status_label).size(12).color(status_color)]
-            .width(96)
-            .align_x(Alignment::End);
+        let side = column![text(status_label).size(12).color(
+            if selected {
+                palette::WHITE
+            } else {
+                status_color
+            }
+        )]
+        .width(96)
+        .align_x(Alignment::End);
 
+        // Java XDM rows are flat white with a hairline divider underneath;
+        // the selection is a solid accent block with white text.
         let card = container(
             row![badge, info, side]
                 .spacing(14)
@@ -937,13 +998,9 @@ impl Gui {
                 .into(),
             ),
             border: iced::Border {
-                color: if selected {
-                    palette::ACCENT
-                } else {
-                    palette::CARD_BORDER
-                },
-                width: 1.0,
-                radius: 8.0.into(),
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
             },
             ..container::Style::default()
         });
@@ -1009,46 +1066,61 @@ impl Gui {
     }
 
     fn modal_card(&self) -> Element<'_, Message> {
+        let input_style = move |_: &Theme, _: text_input::Status| text_input::Style {
+            background: palette::DIALOG_INPUT.into(),
+            border: iced::Border {
+                color: palette::DIALOG_BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            icon: palette::DIALOG_DIM,
+            placeholder: palette::DIALOG_DIM,
+            value: palette::DIALOG_TEXT,
+            selection: iced::Color::from_rgba8(0x33, 0xB5, 0xE5, 0.35),
+        };
+
         container(
             column![
-                text("New download").size(17).color(palette::TEXT),
+                text("New download").size(17).color(palette::DIALOG_TEXT),
                 text_input("https://example.com/file.zip", &self.url)
                     .on_input(Message::UrlInput)
                     .on_submit(Message::Add)
-                    .size(13),
+                    .size(13)
+                    .style(input_style),
                 text_input("destination folder (empty = ~/Downloads)", &self.dest)
                     .on_input(Message::DestInput)
                     .on_submit(Message::Add)
-                    .size(13),
+                    .size(13)
+                    .style(input_style),
                 row![
                     Space::new().width(Length::Fill),
-                    button(text("Cancel").size(13))
+                    button(text("Cancel").size(13).color(palette::DIALOG_DIM))
                         .padding([7, 16])
                         .style(|_: &Theme, status| {
                             let bg = matches!(status, button::Status::Hovered)
-                                .then_some(Color::from_rgb8(0xF0, 0xF1, 0xF3))
+                                .then_some(palette::DIALOG_BORDER)
                                 .map(iced::Background::from);
                             button::Style {
                                 background: bg,
-                                text_color: palette::TEXT_DIM,
+                                text_color: palette::DIALOG_TEXT,
                                 border: iced::Border {
-                                    color: palette::CARD_BORDER,
+                                    color: palette::DIALOG_BORDER,
                                     width: 1.0,
-                                    radius: 6.0.into(),
+                                    radius: 4.0.into(),
                                 },
                                 ..button::Style::default()
                             }
                         })
                         .on_press(Message::CancelModal),
-                    button(text("Download").size(13).color(palette::WHITE))
+                    button(text("Download").size(13).color(palette::TEXT))
                         .padding([7, 16])
                         .style(|_: &Theme, _| button::Style {
                             background: Some(palette::ACCENT.into()),
-                            text_color: palette::WHITE,
+                            text_color: palette::TEXT,
                             border: iced::Border {
                                 color: Color::TRANSPARENT,
                                 width: 0.0,
-                                radius: 6.0.into(),
+                                radius: 4.0.into(),
                             },
                             ..button::Style::default()
                         })
@@ -1062,11 +1134,11 @@ impl Gui {
         .width(540)
         .padding(22)
         .style(|_| container::Style {
-            background: Some(palette::CARD.into()),
+            background: Some(palette::DIALOG_BG.into()),
             border: iced::Border {
-                color: palette::CARD_BORDER,
+                color: palette::DIALOG_BORDER,
                 width: 1.0,
-                radius: 10.0.into(),
+                radius: 0.0.into(),
             },
             shadow: iced::Shadow {
                 color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
@@ -1090,13 +1162,12 @@ fn tool_btn(label: &'static str, enabled: bool, msg: Message) -> Element<'static
         .on_press_maybe(enabled.then_some(msg))
         .style(move |_: &Theme, status| {
             let bg = match status {
-                button::Status::Hovered => Some(Color::from_rgb8(0xF0, 0xF1, 0xF3)),
-                button::Status::Pressed => Some(Color::from_rgb8(0xE4, 0xE6, 0xEA)),
+                button::Status::Hovered if enabled => Some(palette::TOOLBAR_HOVER.into()),
+                button::Status::Pressed if enabled => Some(palette::TOOLBAR_PRESSED.into()),
                 _ => None,
-            }
-            .map(iced::Background::from);
+            };
             let fg = if enabled {
-                palette::TEXT
+                palette::DIALOG_TEXT
             } else {
                 palette::TEXT_DISABLED
             };
