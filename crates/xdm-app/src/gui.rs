@@ -265,6 +265,17 @@ struct DownloadItem {
 }
 
 impl DownloadItem {
+    /// Snapshot for persistence.
+    fn saved(&self) -> SavedEntry {
+        SavedEntry {
+            url: self.url.clone(),
+            dest: self.dest.to_string_lossy().into_owned(),
+            name: self.name.clone(),
+            downloaded: self.progress.downloaded,
+            total: self.progress.total,
+        }
+    }
+
     /// Advances the smoothed speed estimate with a fresh progress sample.
     /// Callers sample at their own cadence (250 ms tick for owned downloads,
     /// ~2 s state-file scans for external ones).
@@ -292,7 +303,6 @@ impl DownloadItem {
     }
 }
 
-#[derive(Default)]
 struct Gui {
     url: String,
     dest: String,
@@ -302,6 +312,77 @@ struct Gui {
     modal_open: bool,
     /// Tick counter; state files are re-scanned every 8th tick (~2 s).
     scan_counter: u32,
+    /// Destinations removed by the user; hidden from the state-file scanner
+    /// until their engine state files disappear.
+    removed: std::collections::HashSet<String>,
+}
+
+impl Default for Gui {
+    fn default() -> Self {
+        // Restores the last session's rows. Everything comes back external
+        // (no engine is owned by a fresh process); the folder scanner then
+        // re-classifies each row against real state files / destinations.
+        let Some(list) = read_list(&list_path()) else {
+            return Self {
+                url: String::new(),
+                dest: String::new(),
+                downloads: Vec::new(),
+                selected: None,
+                category: Category::default(),
+                modal_open: false,
+                scan_counter: 0,
+                removed: std::collections::HashSet::new(),
+            };
+        };
+        let downloads = restore_downloads(&list);
+        let removed: std::collections::HashSet<String> = list.removed.into_iter().collect();
+        Self {
+            url: String::new(),
+            dest: String::new(),
+            downloads,
+            selected: None,
+            category: Category::default(),
+            modal_open: false,
+            scan_counter: 0,
+            removed,
+        }
+    }
+}
+
+/// Rebuilds GUI rows from the persisted list. Rows whose engine state file is
+/// gone and whose destination exists on disk are already finished.
+fn restore_downloads(list: &SavedList) -> Vec<DownloadItem> {
+    let mut items = Vec::with_capacity(list.downloads.len());
+    let mut seen = std::collections::HashSet::new();
+    for entry in &list.downloads {
+        let dest = PathBuf::from(&entry.dest);
+        if !seen.insert(dest.clone()) {
+            continue; // defensive: duplicate rows on disk
+        }
+        let dest_exists = dest.exists();
+        let state_file_exists = dest
+            .parent()
+            .is_some_and(|dir| state_file_path(dir, &entry.name).exists());
+        items.push(DownloadItem {
+            url: entry.url.clone(),
+            dest,
+            name: entry.name.clone(),
+            progress: Progress {
+                downloaded: entry.downloaded,
+                total: entry.total,
+            },
+            // Without a state file there is nothing to resume: a surviving
+            // destination means the engine finished and cleaned up.
+            state: if state_file_exists && dest_exists {
+                State::Paused
+            } else {
+                State::Finished
+            },
+            external: true,
+            ..DownloadItem::default()
+        });
+    }
+    items
 }
 
 impl Gui {
@@ -329,6 +410,8 @@ impl Gui {
                     return Task::none();
                 }
                 let dest = destination(&url, &self.dest);
+                // A fresh add clears any earlier remove-tombstone for it.
+                self.removed.remove(dest.to_string_lossy().as_ref());
                 // Re-adding an existing destination resumes that row instead
                 // of spawning a second engine on the same files.
                 if let Some(pos) = self.downloads.iter().position(|it| it.dest == dest) {
@@ -361,6 +444,7 @@ impl Gui {
                 self.modal_open = false;
                 self.url.clear();
                 self.spawn_run(i, CancellationToken::new());
+                self.persist();
                 Task::none()
             }
             Message::Tick => {
@@ -416,7 +500,11 @@ impl Gui {
                 if self.selected == Some(i) {
                     self.selected = None;
                 }
-                self.downloads.remove(i);
+                let item = self.downloads.remove(i);
+                // The engine's state file may outlive this removal; remember
+                // the destination so the scanner cannot resurrect the row.
+                self.removed.insert(item.dest.to_string_lossy().into_owned());
+                self.persist();
                 Task::none()
             }
             Message::OpenFolder(i) => {
@@ -536,6 +624,16 @@ impl Gui {
     /// processes (CLI runs, a previous GUI session). New files appear as
     /// external rows; vanished files become `Finished` (or are dropped). Files
     /// whose destination is already tracked are skipped.
+    /// Writes the current rows + removed set to disk (best effort; a failed
+    /// save must never take the UI down).
+    fn persist(&self) {
+        let list = SavedList {
+            downloads: self.downloads.iter().map(DownloadItem::saved).collect(),
+            removed: self.removed.iter().cloned().collect(),
+        };
+        let _ = write_list(&list_path(), &list);
+    }
+
     fn scan_state_files(&mut self) {
         let dir = downloads_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -581,9 +679,13 @@ impl Gui {
             }
         }
 
-        // Track newly discovered state files.
+        // Track newly discovered state files, except destinations the user
+        // explicitly removed from the list.
         for (dest, state, fresh) in found {
             if self.downloads.iter().any(|it| it.dest == dest) {
+                continue;
+            }
+            if self.removed.contains(dest.to_string_lossy().as_ref()) {
                 continue;
             }
             let name = dest
@@ -621,6 +723,20 @@ impl Gui {
                 false
             }
         });
+
+        // A removed destination is only memorable while its engine state file
+        // still lives; once that file is gone there is nothing to re-enter.
+        self.removed.retain(|dest| {
+            let p = Path::new(dest);
+            p.parent().is_some_and(|dir| {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                name.is_some_and(|n| state_file_path(dir, &n).exists())
+            })
+        });
+
+        // Snapshot after every classification pass (~2 s) so a crash or kill
+        // loses at most that much state.
+        self.persist();
     }
 
     fn category_shows(&self, item: &DownloadItem, cat: Category) -> bool {
@@ -1222,6 +1338,65 @@ fn downloads_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_owned())).join("Downloads")
 }
 
+/// Persisted list entry: everything the GUI needs to redraw a row after a
+/// restart. Progress is the last observed snapshot; the folder scanner
+/// corrects it against state files (and marks finished downloads) later.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SavedEntry {
+    url: String,
+    dest: String,
+    name: String,
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+/// The whole on-disk list. `removed` holds destinations the user deleted whose
+/// engine state files may still exist — those must not re-appear as
+/// externally-driven rows on the next start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SavedList {
+    #[serde(default)]
+    downloads: Vec<SavedEntry>,
+    #[serde(default)]
+    removed: Vec<String>,
+}
+
+/// Where the GUI list lives (XDM keeps data under ~/.local/share).
+fn list_path() -> PathBuf {
+    let data = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_owned()))
+                .join(".local/share")
+        });
+    data.join("xdm").join("gui-list.json")
+}
+
+/// Serializes the list atomically (write + rename so a crash cannot corrupt it).
+fn write_list(path: &Path, list: &SavedList) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let Ok(json) = serde_json::to_string_pretty(list) else {
+        return false;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        std::fs::rename(&tmp, path).is_ok()
+    } else {
+        false
+    }
+}
+
+fn read_list(path: &Path) -> Option<SavedList> {
+    let bytes = std::fs::read(path).ok()?;
+    // Ignore new unknown fields from a future version: serde default.
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Strips `.{name}.xdm-state.json` down to `{name}`; `None` for other files.
 fn state_file_base(file_name: &str) -> Option<&str> {
     let rest = file_name.strip_prefix('.')?;
@@ -1330,5 +1505,30 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(2));
         assert_eq!(retry_delay(4), Duration::from_secs(8));
         assert_eq!(retry_delay(20), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn list_roundtrips_and_tolerates_bad_files() {
+        let path = std::env::temp_dir().join(format!("xdm-gui-list-{}.json", std::process::id()));
+        let entries = SavedEntry {
+            url: "https://example.com/d/a.pkg".to_owned(),
+            dest: "/tmp/a.pkg".to_owned(),
+            name: "a.pkg".to_owned(),
+            downloaded: 5,
+            total: Some(10),
+        };
+        let list = SavedList {
+            downloads: vec![entries],
+            removed: vec![String::from("/tmp/dead.bin")],
+        };
+        assert!(write_list(&path, &list));
+        assert_eq!(read_list(&path), Some(list));
+        // A future version's file (unknown fields) still reads back.
+        let _ = std::fs::write(&path, r#"{"downloads": [], "removed": [], "extra": 1}"#);
+        assert_eq!(read_list(&path), Some(SavedList::default()));
+        // Corrupt files simply yield nothing; the UI must not panic.
+        let _ = std::fs::write(&path, "not json");
+        assert_eq!(read_list(&path), None);
+        let _ = std::fs::remove_file(&path);
     }
 }

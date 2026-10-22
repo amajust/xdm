@@ -3580,6 +3580,7 @@ name = "xdm-app"
 version = "10.0.0"
 dependencies = [
  "iced",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

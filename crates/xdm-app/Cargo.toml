@@ -8,6 +8,7 @@ description = "XDM desktop app and CLI (Rust rewrite, iced GUI)"
 
 [dependencies]
 xdm-core = { path = "../xdm-core" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
