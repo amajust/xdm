@@ -64,6 +64,28 @@ mod palette {
     pub const WHITE: Color = Color::from_rgb8(0xFF, 0xFF, 0xFF);
 }
 
+/// The modal backdrop used to be a translucent 45%-black quad over the live
+/// layout. With tiny-skia's incremental damage rendering, every small redraw
+/// (hover changes under the dialog) re-blends that quad onto pixels that
+/// already contain it, flashing darker until the next full redraw — the
+/// "black transparent flicker". [`shade`] pre-multiplies each surface color by
+/// the same factor so the dimmed layout is fully opaque: identical final
+/// pixels, no alpha compositing left to mis-blend.
+const DIM_FACTOR: f32 = 0.55;
+
+pub fn shade(c: Color, dimmed: bool) -> Color {
+    if dimmed {
+        Color {
+            r: c.r * DIM_FACTOR,
+            g: c.g * DIM_FACTOR,
+            b: c.b * DIM_FACTOR,
+            a: 1.0,
+        }
+    } else {
+        c
+    }
+}
+
 /// System tray integration (StatusNotifierItem, native to KDE Plasma).
 ///
 /// The tray lives on the shared tokio runtime; callbacks push commands into a
@@ -491,6 +513,10 @@ struct Gui {
     window_id: Option<Id>,
     /// The close button was pressed; show the minimize-to-tray dialog.
     confirm_quit: bool,
+    /// True while a modal dialog is up: the main layout renders with every
+    /// color pre-dimmed (see [`shade`]) instead of under a translucent
+    /// backdrop, which flickers under incremental software rendering.
+    dimmed: bool,
 }
 
 impl Default for Gui {
@@ -510,6 +536,7 @@ impl Default for Gui {
                 removed: std::collections::HashSet::new(),
                 window_id: None,
                 confirm_quit: false,
+                dimmed: false,
             };
         };
         let downloads = restore_downloads(&list);
@@ -525,6 +552,7 @@ impl Default for Gui {
             removed,
             window_id: None,
             confirm_quit: false,
+            dimmed: false,
         }
     }
 }
@@ -575,7 +603,7 @@ fn restore_downloads(list: &SavedList) -> Vec<DownloadItem> {
 
 impl Gui {
     fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
+        let task = match message {
             Message::UrlInput(s) => {
                 self.url = s;
                 Task::none()
@@ -779,7 +807,12 @@ impl Gui {
                 }
                 Task::none()
             }
-        }
+        };
+
+        // Every modal state change flows through here: keep the dim flag in
+        // sync in one place instead of touching each match arm.
+        self.dimmed = self.modal_open || self.confirm_quit;
+        task
     }
 
     /// Raises the main window (or restores one after tray-minimize). Shared
@@ -1075,6 +1108,11 @@ impl Gui {
 
     /// Daemon view: one window at a time, `id` is irrelevant (same UI).
     fn view(&self, _id: Id) -> Element<'_, Message> {
+        // While a dialog is up the same layout renders with every color
+        // pre-dimmed (self.dimmed): it doubles as the backdrop. That keeps
+        // the exact 45%-black-overlay look with zero translucent pixels —
+        // translucent layers over live content flicker under tiny-skia's
+        // incremental damage rendering.
         let layout = column![
             self.toolbar(),
             row![self.sidebar(), self.content()]
@@ -1086,16 +1124,19 @@ impl Gui {
         .height(Length::Fill);
 
         if self.confirm_quit {
-            stack![layout, self.modal_backdrop(Message::CancelQuit), self.quit_card()]
+            // Clicking anywhere outside the card cancels the quit dialog.
+            stack![mouse_area(layout).on_press(Message::CancelQuit), self.quit_card()]
                 .into()
         } else if self.modal_open {
-            stack![layout, self.modal_backdrop(Message::CancelModal), self.modal_card()].into()
+            stack![mouse_area(layout).on_press(Message::CancelModal), self.modal_card()]
+                .into()
         } else {
             layout.into()
         }
     }
 
     fn toolbar(&self) -> Element<'_, Message> {
+        let dim = self.dimmed;
         let sel = self.selected;
         let sel_state = sel.and_then(|i| self.downloads.get(i)).map(|it| it.state);
         let can_resume = matches!(sel_state, Some(State::Paused) | Some(State::Failed));
@@ -1103,20 +1144,20 @@ impl Gui {
         let can_target = sel.is_some();
 
         let divider = || {
-            container("").width(1).height(22).style(|_| container::Style {
-                background: Some(palette::DIALOG_BORDER.into()),
+            container("").width(1).height(22).style(move |_| container::Style {
+                background: Some(shade(palette::DIALOG_BORDER, dim).into()),
                 ..container::Style::default()
             })
         };
 
         let bar = row![
-            tool_btn("New", true, Message::NewDownload),
+            tool_btn("New", true, Message::NewDownload, dim),
             divider(),
-            tool_btn("Resume", can_resume, Message::Resume(sel.unwrap_or(0))),
-            tool_btn("Pause", can_pause, Message::Pause(sel.unwrap_or(0))),
+            tool_btn("Resume", can_resume, Message::Resume(sel.unwrap_or(0)), dim),
+            tool_btn("Pause", can_pause, Message::Pause(sel.unwrap_or(0)), dim),
             divider(),
-            tool_btn("Remove", can_target, Message::Remove(sel.unwrap_or(0))),
-            tool_btn("Folder", can_target, Message::OpenFolder(sel.unwrap_or(0))),
+            tool_btn("Remove", can_target, Message::Remove(sel.unwrap_or(0)), dim),
+            tool_btn("Folder", can_target, Message::OpenFolder(sel.unwrap_or(0)), dim),
         ]
         .padding([6, 10])
         .spacing(2)
@@ -1125,12 +1166,12 @@ impl Gui {
         column![
             container(bar)
                 .width(Length::Fill)
-                .style(|_| container::Style {
-                    background: Some(palette::TOOLBAR.into()),
+                .style(move |_| container::Style {
+                    background: Some(shade(palette::TOOLBAR, dim).into()),
                     ..container::Style::default()
                 }),
-            rule::horizontal(1.0).style(|_| rule::Style {
-                color: palette::CARD_BORDER,
+            rule::horizontal(1.0).style(move |_| rule::Style {
+                color: shade(palette::CARD_BORDER, dim),
                 radius: 0.0.into(),
                 fill_mode: rule::FillMode::Full,
                 snap: true,
@@ -1140,6 +1181,7 @@ impl Gui {
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
+        let dim = self.dimmed;
         let cats = [
             Category::All,
             Category::Videos,
@@ -1156,20 +1198,21 @@ impl Gui {
             .width(196)
             .height(Length::Fill)
             .padding([14, 8])
-            .style(|_| container::Style {
-                background: Some(palette::SIDEBAR.into()),
+            .style(move |_| container::Style {
+                background: Some(shade(palette::SIDEBAR, dim).into()),
                 ..container::Style::default()
             })
             .into()
     }
 
     fn side_item(&self, cat: Category) -> Element<'_, Message> {
+        let dim = self.dimmed;
         let active = self.category == cat;
         let count = self.count(cat);
 
         let content = row![
             container("").width(9).height(9).style(move |_| container::Style {
-                background: Some(cat.dot().into()),
+                background: Some(shade(cat.dot(), dim).into()),
                 border: iced::Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
@@ -1177,9 +1220,9 @@ impl Gui {
                 },
                 ..container::Style::default()
             }),
-            text(cat.label()).size(13),
+            text(cat.label()).size(13).color(shade(palette::TEXT, dim)),
             Space::new().width(Length::Fill),
-            text(count.to_string()).size(11),
+            text(count.to_string()).size(11).color(shade(palette::TEXT, dim)),
         ]
         .spacing(10)
         .align_y(Alignment::Center)
@@ -1190,15 +1233,15 @@ impl Gui {
             .on_press(Message::Category(cat))
             .style(move |_: &Theme, status| {
                 let bg = if active {
-                    Some(palette::SIDEBAR_ACTIVE.into())
+                    Some(shade(palette::SIDEBAR_ACTIVE, dim).into())
                 } else if matches!(status, button::Status::Hovered) {
-                    Some(palette::SIDEBAR_HOVER.into())
+                    Some(shade(palette::SIDEBAR_HOVER, dim).into())
                 } else {
                     None
                 };
                 button::Style {
                     background: bg,
-                    text_color: palette::TEXT,
+                    text_color: shade(palette::TEXT, dim),
                     border: iced::Border {
                         color: Color::TRANSPARENT,
                         width: 0.0,
@@ -1211,6 +1254,7 @@ impl Gui {
     }
 
     fn content(&self) -> Element<'_, Message> {
+        let dim = self.dimmed;
         // Java XDM separates flat white rows with a 1 px hairline instead of
         // spacing.
         let mut stack: Vec<Element<'_, Message>> = Vec::new();
@@ -1228,8 +1272,8 @@ impl Gui {
                     container("")
                         .width(Length::Fill)
                         .height(1)
-                        .style(|_| container::Style {
-                            background: Some(palette::CARD_BORDER.into()),
+                        .style(move |_| container::Style {
+                            background: Some(shade(palette::CARD_BORDER, dim).into()),
                             ..container::Style::default()
                         })
                         .into(),
@@ -1240,10 +1284,12 @@ impl Gui {
         let body: Element<'_, Message> = if stack.is_empty() {
             container(
                 column![
-                    text("Nothing here yet").size(16).color(palette::TEXT_DIM),
+                    text("Nothing here yet")
+                        .size(16)
+                        .color(shade(palette::TEXT_DIM, dim)),
                     text("Click  + New  to start a download")
                         .size(12)
-                        .color(palette::TEXT_DIM),
+                        .color(shade(palette::TEXT_DIM, dim)),
                 ]
                 .spacing(6)
                 .align_x(Alignment::Center),
@@ -1267,14 +1313,15 @@ impl Gui {
         container(body)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(palette::CONTENT.into()),
+            .style(move |_| container::Style {
+                background: Some(shade(palette::CONTENT, dim).into()),
                 ..container::Style::default()
             })
             .into()
     }
 
     fn download_row<'a>(&'a self, i: usize, item: &'a DownloadItem) -> Element<'a, Message> {
+        let dim = self.dimmed;
         let selected = self.selected == Some(i);
         let cat = category_for(&item.name);
         let pct = match item.progress.total {
@@ -1329,14 +1376,14 @@ impl Gui {
         let badge = container(
             text(badge_label(&item.name))
                 .size(10)
-                .color(palette::WHITE),
+                .color(shade(palette::WHITE, dim)),
         )
         .width(44)
         .height(44)
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(move |_| container::Style {
-            background: Some(cat.badge().into()),
+            background: Some(shade(cat.badge(), dim).into()),
             border: iced::Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
@@ -1350,9 +1397,9 @@ impl Gui {
                 .size(14)
                 .color(
                     if selected {
-                        palette::WHITE
+                        shade(palette::WHITE, dim)
                     } else {
-                        palette::TEXT
+                        shade(palette::TEXT, dim)
                     }
                 )
                 .font(Font {
@@ -1360,8 +1407,8 @@ impl Gui {
                     ..Font::default()
                 }),
             container(progress_bar(0.0..=1.0, pct).style(move |_| progress_bar::Style {
-                background: palette::TRACK.into(),
-                bar: bar_color.into(),
+                background: shade(palette::TRACK, dim).into(),
+                bar: shade(bar_color, dim).into(),
                 border: iced::Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
@@ -1373,24 +1420,24 @@ impl Gui {
             row![
                 text(size_line).size(11).color(
                     if selected {
-                        palette::WHITE
+                        shade(palette::WHITE, dim)
                     } else {
-                        palette::TEXT_DIM
+                        shade(palette::TEXT_DIM, dim)
                     }
                 ),
                 Space::new().width(Length::Fill),
                 text(speed_text).size(11).color(
                     if selected {
-                        palette::WHITE
+                        shade(palette::WHITE, dim)
                     } else {
-                        palette::TEXT_DIM
+                        shade(palette::TEXT_DIM, dim)
                     }
                 ),
                 text(eta).size(11).color(
                     if selected {
-                        palette::WHITE
+                        shade(palette::WHITE, dim)
                     } else {
-                        palette::TEXT_DIM
+                        shade(palette::TEXT_DIM, dim)
                     }
                 ),
             ]
@@ -1404,14 +1451,14 @@ impl Gui {
             && !retrying
             && let Some(err) = &item.error_text
         {
-            info = info.push(text(err.as_str()).size(11).color(palette::RED));
+            info = info.push(text(err.as_str()).size(11).color(shade(palette::RED, dim)));
         }
 
         let side = column![text(status_label).size(12).color(
             if selected {
-                palette::WHITE
+                shade(palette::WHITE, dim)
             } else {
-                status_color
+                shade(status_color, dim)
             }
         )]
         .width(96)
@@ -1430,9 +1477,9 @@ impl Gui {
         .style(move |_| container::Style {
             background: Some(
                 if selected {
-                    palette::ROW_SELECTED
+                    shade(palette::ROW_SELECTED, dim)
                 } else {
-                    palette::CARD
+                    shade(palette::CARD, dim)
                 }
                 .into(),
             ),
@@ -1448,6 +1495,7 @@ impl Gui {
     }
 
     fn status_bar(&self) -> Element<'_, Message> {
+        let dim = self.dimmed;
         let active = self
             .downloads
             .iter()
@@ -1469,38 +1517,24 @@ impl Gui {
             row![
                 text(format!("{} items", self.downloads.len()))
                     .size(11)
-                    .color(palette::TEXT_DIM),
+                    .color(shade(palette::TEXT_DIM, dim)),
                 Space::new().width(Length::Fill),
-                text(right).size(11).color(palette::TEXT_DIM),
+                text(right).size(11).color(shade(palette::TEXT_DIM, dim)),
             ]
             .spacing(10)
             .width(Length::Fill),
         )
         .width(Length::Fill)
         .padding([5, 14])
-        .style(|_| container::Style {
-            background: Some(palette::CARD.into()),
+        .style(move |_| container::Style {
+            background: Some(shade(palette::CARD, dim).into()),
             border: iced::Border {
-                color: palette::CARD_BORDER,
+                color: shade(palette::CARD_BORDER, dim),
                 width: 1.0,
                 radius: 0.0.into(),
             },
             ..container::Style::default()
         })
-        .into()
-    }
-
-    fn modal_backdrop(&self, on_press: Message) -> Element<'_, Message> {
-        mouse_area(
-            container("")
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_| container::Style {
-                    background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
-                    ..container::Style::default()
-                }),
-        )
-        .on_press(on_press)
         .into()
     }
 
@@ -1561,11 +1595,6 @@ impl Gui {
                 color: palette::DIALOG_BORDER,
                 width: 1.0,
                 radius: 0.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
-                offset: iced::Vector::new(0.0, 6.0),
-                blur_radius: 24.0,
             },
             ..container::Style::default()
         })
@@ -1647,11 +1676,6 @@ impl Gui {
                 width: 1.0,
                 radius: 0.0.into(),
             },
-            shadow: iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.25),
-                offset: iced::Vector::new(0.0, 6.0),
-                blur_radius: 24.0,
-            },
             ..container::Style::default()
         })
         .into()
@@ -1668,20 +1692,29 @@ impl Gui {
 }
 
 /// Toolbar button: plain text label, grayed out when disabled.
-fn tool_btn(label: &'static str, enabled: bool, msg: Message) -> Element<'static, Message> {
-    button(text(label).size(13))
+fn tool_btn(
+    label: &'static str,
+    enabled: bool,
+    msg: Message,
+    dim: bool,
+) -> Element<'static, Message> {
+    button(text(label).size(13).color(shade(palette::DIALOG_TEXT, dim)))
         .padding([6, 14])
         .on_press_maybe(enabled.then_some(msg))
         .style(move |_: &Theme, status| {
             let bg = match status {
-                button::Status::Hovered if enabled => Some(palette::TOOLBAR_HOVER.into()),
-                button::Status::Pressed if enabled => Some(palette::TOOLBAR_PRESSED.into()),
+                button::Status::Hovered if enabled => {
+                    Some(shade(palette::TOOLBAR_HOVER, dim).into())
+                }
+                button::Status::Pressed if enabled => {
+                    Some(shade(palette::TOOLBAR_PRESSED, dim).into())
+                }
                 _ => None,
             };
             let fg = if enabled {
-                palette::DIALOG_TEXT
+                shade(palette::DIALOG_TEXT, dim)
             } else {
-                palette::TEXT_DISABLED
+                shade(palette::TEXT_DISABLED, dim)
             };
             button::Style {
                 background: bg,
