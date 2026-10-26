@@ -60,13 +60,10 @@ jobs:
         run: cargo test -p xdm-core -p xdm-app
       - name: Build (release)
         run: cargo build --release -p xdm-app
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path target/release/xdm-app.exe -DestinationPath xdm-app-${{ matrix.name }}.zip
+      - name: Package (tar.gz on every platform)
+        # Windows 10+ ships bsdtar, which handles -z natively; keeping one
+        # archive format across platforms simplifies scripting.
+        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -103,13 +100,10 @@ jobs:
         run: cargo test -p xdm-core -p xdm-app
       - name: Build (release)
         run: cargo build --release -p xdm-app
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path target/release/xdm-app.exe -DestinationPath xdm-app-${{ matrix.name }}.zip
+      - name: Package (tar.gz on every platform)
+        # Windows 10+ ships bsdtar, which handles -z natively; keeping one
+        # archive format across platforms simplifies scripting.
+        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app${{ runner.os == 'Windows' && '.exe' || '' }}
       # Three matrix jobs race to publish; create falls back to upload when
       # a sibling already created the release.
       - name: Attach to GitHub release
