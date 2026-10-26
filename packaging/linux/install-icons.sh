@@ -10,9 +10,14 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-logo="$repo_root/crates/xdm-app/assets/xdm-rust.png"
+# Master logo (any size >= 256 px works); the app embeds a 256 px copy.
+master="$repo_root/crates/xdm-app/assets/xdm-rust-logo.png"
+logo="$repo_root/crates/xdm-app/assets/xdm-logo-256.png"
 
-[ -f "$logo" ] || { echo "missing $logo" >&2; exit 1; }
+[ -f "$master" ] || { echo "missing $master" >&2; exit 1; }
+
+# 0. 256 px copy the binaries embed (keeps the exe small and startup fast).
+magick "$master" -resize 256x256 "$logo"
 command -v magick >/dev/null 2>&1 || { echo "ImageMagick (magick) is required" >&2; exit 1; }
 
 # 1. Windows .ico (explorer/taskbar icon embedded in the exe).
@@ -41,5 +46,5 @@ command -v gtk-update-icon-cache >/dev/null 2>&1 \
 command -v update-desktop-database >/dev/null 2>&1 \
     && update-desktop-database "$apps_dir" 2>/dev/null || true
 
-echo "Regenerated .ico from $logo and installed Linux icons to $data_home"
+echo "Regenerated .ico + hicolor icons from $master and installed to $data_home"
 echo "Restart the app (and re-login if the taskbar is stubborn) to see it."

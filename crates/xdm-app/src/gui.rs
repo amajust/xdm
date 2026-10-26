@@ -179,7 +179,7 @@ mod tray {
         static PIXMAP: OnceLock<Icon> = OnceLock::new();
         PIXMAP
             .get_or_init(|| {
-                let rgba = image::load_from_memory(include_bytes!("../assets/xdm-rust.png"))
+                let rgba = image::load_from_memory(include_bytes!("../assets/xdm-logo-256.png"))
                     .expect("bundled logo decodes")
                     .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
                     .into_rgba8();
@@ -236,7 +236,7 @@ fn window_settings() -> iced::window::Settings {
 fn app_icon() -> Option<iced::window::Icon> {
     static ICON: OnceLock<Option<iced::window::Icon>> = OnceLock::new();
     ICON.get_or_init(|| {
-        let rgba = image::load_from_memory(include_bytes!("../assets/xdm-rust.png"))
+        let rgba = image::load_from_memory(include_bytes!("../assets/xdm-logo-256.png"))
             .ok()?
             .into_rgba8();
         let (width, height) = rgba.dimensions();
