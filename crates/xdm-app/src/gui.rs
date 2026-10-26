@@ -278,7 +278,6 @@ pub enum Message {
     Category(Category),
     Pause(usize),
     Resume(usize),
-    Remove(usize),
     OpenFolder(usize),
     /// Row action: ask to delete the row and its files from disk.
     RowDelete(usize),
@@ -816,22 +815,6 @@ impl Gui {
                 }
                 Task::none()
             }
-            Message::Remove(i) => {
-                if let Some(item) = self.downloads.get(i)
-                    && let Some(cancel) = &item.cancel
-                {
-                    cancel.cancel();
-                }
-                if self.selected == Some(i) {
-                    self.selected = None;
-                }
-                let item = self.downloads.remove(i);
-                // The engine's state file may outlive this removal; remember
-                // the destination so the scanner cannot resurrect the row.
-                self.removed.insert(item.dest.to_string_lossy().into_owned());
-                self.persist();
-                Task::none()
-            }
             Message::OpenFolder(i) => {
                 if let Some(item) = self.downloads.get(i) {
                     let dir = item
@@ -849,11 +832,7 @@ impl Gui {
                 Task::none()
             }
             Message::RowDelete(i) => {
-                // An external row's files belong to another process; the
-                // button is disabled for those, this is just a guard.
-                if self.downloads.get(i).is_some_and(|it| !it.external) {
-                    self.confirm_delete = Some(i);
-                }
+                self.confirm_delete = Some(i);
                 Task::none()
             }
             Message::CancelDelete => {
@@ -875,15 +854,18 @@ impl Gui {
                     self.selected = self.selected.map(|s| s - 1);
                 }
                 let item = self.downloads.remove(i);
-                let dest = item.dest.clone();
-                let state_path = state_file_for(&item.dest);
+                if !item.external {
+                    let dest = item.dest.clone();
+                    let state_path = state_file_for(&item.dest);
+                    rt().spawn(async move {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        let _ = tokio::fs::remove_file(&state_path).await;
+                    });
+                }
                 // Tombstone the destination so the scanner cannot resurrect
-                // the row from the (possibly not yet deleted) state file.
-                self.removed.insert(dest.to_string_lossy().into_owned());
-                rt().spawn(async move {
-                    let _ = tokio::fs::remove_file(&dest).await;
-                    let _ = tokio::fs::remove_file(&state_path).await;
-                });
+                // the row from a (possibly not yet deleted) state file.
+                self.removed
+                    .insert(item.dest.to_string_lossy().into_owned());
                 self.persist();
                 Task::none()
             }
@@ -1240,7 +1222,6 @@ impl Gui {
         let sel_state = sel.and_then(|i| self.downloads.get(i)).map(|it| it.state);
         let can_resume = matches!(sel_state, Some(State::Paused) | Some(State::Failed));
         let can_pause = sel_state == Some(State::Running);
-        let can_target = sel.is_some();
 
         let divider = || {
             container("").width(1).height(22).style(move |_| container::Style {
@@ -1254,9 +1235,6 @@ impl Gui {
             divider(),
             tool_btn("Resume", can_resume, Message::Resume(sel.unwrap_or(0)), dim),
             tool_btn("Pause", can_pause, Message::Pause(sel.unwrap_or(0)), dim),
-            divider(),
-            tool_btn("Remove", can_target, Message::Remove(sel.unwrap_or(0)), dim),
-            tool_btn("Folder", can_target, Message::OpenFolder(sel.unwrap_or(0)), dim),
         ]
         .padding([6, 10])
         .spacing(2)
@@ -1553,7 +1531,6 @@ impl Gui {
             info = info.push(text(err.as_str()).size(11).color(shade(palette::RED, dim)));
         }
 
-        let can_delete = !item.external;
         let side = column![
             text(status_label).size(12).color(
                 if selected {
@@ -1566,13 +1543,13 @@ impl Gui {
             // row together with its files (asks for confirmation).
             row![
                 row_btn("Folder", true, Message::OpenFolder(i), dim),
-                row_btn("Delete", can_delete, Message::RowDelete(i), dim),
+                row_btn("Delete", true, Message::RowDelete(i), dim),
             ]
-            .spacing(4)
+            .spacing(6)
             .align_y(Alignment::Center),
         ]
-        .width(96)
-        .spacing(6)
+        .width(Length::Shrink)
+        .spacing(8)
         .align_x(Alignment::End);
 
         // Java XDM rows are flat white with a hairline divider underneath;
@@ -1713,17 +1690,20 @@ impl Gui {
     }
 
     fn delete_card(&self) -> Element<'_, Message> {
-        let name = self
+        let (name, external) = self
             .confirm_delete
             .and_then(|i| self.downloads.get(i))
-            .map(|it| it.name.clone())
+            .map(|it| (it.name.clone(), it.external))
             .unwrap_or_default();
+        let detail = if external {
+            format!("\"{name}\" will be removed from the list (its files are managed by another process).")
+        } else {
+            format!("\"{name}\" and its downloaded files will be removed from disk.")
+        };
         container(
             column![
                 text("Delete this download?").size(17).color(palette::DIALOG_TEXT),
-                text(format!(
-                    "\"{name}\" and its downloaded files will be removed from disk."
-                ))
+                text(detail)
                 .size(13)
                 .color(palette::DIALOG_DIM),
                 row![
@@ -2038,8 +2018,8 @@ fn row_btn(
     msg: Message,
     dim: bool,
 ) -> Element<'static, Message> {
-    button(text(label).size(10).color(shade(palette::DIALOG_TEXT, dim)))
-        .padding([3, 6])
+    button(text(label).size(11).color(shade(palette::DIALOG_TEXT, dim)))
+        .padding([4, 9])
         .on_press_maybe(enabled.then_some(msg))
         .style(move |_: &Theme, status| {
             let bg = match status {
