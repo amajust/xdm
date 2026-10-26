@@ -1,0 +1,77 @@
+name: Rust
+
+# CI for the Rust rewrite (crates/*). The legacy Java pipelines live in
+# binaries.yml / build.yml and stay untouched.
+
+on:
+  push:
+    branches: [ rust-rewrite ]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    branches: [ rust-rewrite ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    name: clippy + tests (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Build-time insurance for iced's Wayland/x11 backends; the runner
+      # usually has them, the update keeps the versions current.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64 }
+          - { os: macos-latest, name: macos-aarch64 }
+          - { os: windows-latest, name: windows-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+      - name: Tests
+        run: cargo test -p xdm-core -p xdm-app
+      - name: Build (release)
+        run: cargo build --release -p xdm-app
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/xdm-app.exe -DestinationPath xdm-app-${{ matrix.name }}.zip
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdm-app-${{ matrix.name }}
+          path: xdm-app-${{ matrix.name }}.*
+          if-no-files-found: error

@@ -90,7 +90,11 @@ pub fn shade(c: Color, dimmed: bool) -> Color {
 ///
 /// The tray lives on the shared tokio runtime; callbacks push commands into a
 /// static slot which the GUI tick drains ([`tray::take_command`]). Keeping the
-/// link one-directional avoids any blocking call on either side.
+/// link one-directional avoids any blocking call on either side. Linux-only:
+/// D-Bus StatusNotifier is the only tray protocol iced itself doesn't cover;
+/// on macOS (menu bar / dock) and Windows (taskbar) the convention is to
+/// close = quit, so there is no tray to hide to.
+#[cfg(target_os = "linux")]
 mod tray {
     use ksni::menu::StandardItem;
     use ksni::{Icon, MenuItem, ToolTip, Tray};
@@ -231,6 +235,7 @@ pub fn run() -> iced::Result {
     // The tray service lives on the shared tokio runtime; its callbacks only
     // push commands into a static slot that the GUI tick polls, so a tray
     // activation can never block the D-Bus menu thread on UI work.
+    #[cfg(target_os = "linux")]
     rt().spawn(async {
         match ksni::TrayMethods::spawn(tray::TrayState).await {
             Ok(handle) => std::mem::forget(handle),
@@ -675,6 +680,7 @@ impl Gui {
                     tasks.push(iced::window::latest().map(Message::GotWindowId));
                 }
                 // Tray requests (window show, quit) arrive out of band.
+                #[cfg(target_os = "linux")]
                 tasks.extend(tray::take_command().map(|cmd| match cmd {
                     tray::TrayCmd::Show => self.show_window(),
                     tray::TrayCmd::Quit => {
@@ -705,21 +711,42 @@ impl Gui {
                 Task::none()
             }
             Message::WinClose => {
-                // X button pressed: ask before leaving (XDM-style close dialog).
-                self.confirm_quit = true;
+                // X button pressed: ask before leaving (XDM-style close
+                // dialog). Without a tray (macOS/Windows) there is nothing
+                // to minimize to, so the window just quits the daemon.
+                #[cfg(target_os = "linux")]
+                {
+                    self.confirm_quit = true;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.persist();
+                    return self.quit_task();
+                }
+                #[cfg(target_os = "linux")]
                 Task::none()
             }
             Message::HideToTray => {
-                self.confirm_quit = false;
-                match self.window_id.take() {
-                    // winit has no Wayland hide; destroying the window *is*
-                    // the tray-minimized state: no taskbar entry, everything
-                    // keeps running (subscriptions are daemon-level).
-                    Some(id) => {
-                        self.persist();
-                        iced::window::close(id)
+                // No tray, no hidden life: an honest full quit.
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.persist();
+                    return self.quit_task();
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    self.confirm_quit = false;
+                    match self.window_id.take() {
+                        // winit has no Wayland hide; destroying the window
+                        // *is* the tray-minimized state: no taskbar entry,
+                        // everything keeps running (subscriptions are
+                        // daemon-level).
+                        Some(id) => {
+                            self.persist();
+                            iced::window::close(id)
+                        }
+                        None => Task::none(),
                     }
-                    None => Task::none(),
                 }
             }
             Message::Quit => {
@@ -1941,6 +1968,7 @@ mod tests {
         assert_eq!(retry_delay(20), Duration::from_secs(30));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn tray_icon_is_arbg32_disc_with_arrow() {
         let icon = tray::icon();
