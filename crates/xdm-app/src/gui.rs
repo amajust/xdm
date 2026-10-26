@@ -863,11 +863,48 @@ impl Gui {
                 }
                 let item = self.downloads.remove(i);
                 if !item.external {
+                    let status = item.status.clone();
                     let dest = item.dest.clone();
                     let state_path = state_file_for(&item.dest);
                     rt().spawn(async move {
-                        let _ = tokio::fs::remove_file(&dest).await;
-                        let _ = tokio::fs::remove_file(&state_path).await;
+                        // A running engine holds the destination open; on
+                        // Windows the delete would fail with a sharing
+                        // violation, and on any OS the engine could still
+                        // rewrite its state file afterwards. Wait for the
+                        // engine to report a non-running state first.
+                        if status.load(Ordering::Relaxed) == st::RUNNING {
+                            let deadline =
+                                tokio::time::Instant::now() + Duration::from_secs(3);
+                            while status.load(Ordering::Relaxed) == st::RUNNING
+                                && tokio::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            // Grace period for the engine to release handles.
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                        // Retry a few times: antivirus/indexers on Windows
+                        // can hold the file briefly after the engine exits.
+                        for path in [dest, state_path] {
+                            for _ in 0..3 {
+                                match tokio::fs::remove_file(&path).await {
+                                    Ok(()) => break,
+                                    Err(e)
+                                        if e.kind() == std::io::ErrorKind::NotFound =>
+                                    {
+                                        break
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "xdm-app: delete {}: {e}; retrying",
+                                            path.display()
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(250))
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
                     });
                 }
                 // Tombstone the destination so the scanner cannot resurrect
