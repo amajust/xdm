@@ -10,7 +10,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-logo="$repo_root/crates/xdm-app/assets/xdm-logo-256.png"
+logo="$repo_root/crates/xdm-app/assets/xdm-rust.png"
 
 [ -f "$logo" ] || { echo "missing $logo" >&2; exit 1; }
 command -v magick >/dev/null 2>&1 || { echo "ImageMagick (magick) is required" >&2; exit 1; }
