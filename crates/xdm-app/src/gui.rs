@@ -217,6 +217,15 @@ fn window_settings() -> iced::window::Settings {
         size: (1020, 640).into(),
         exit_on_close_request: false,
         icon: app_icon(),
+        // iced defaults the application_id to an EMPTY string and passes it
+        // to winit unconditionally, which leaves the Wayland app_id (and the
+        // X11 class) blank — compositors then cannot resolve a taskbar icon
+        // by app_id at all. Set it explicitly to match xdm-app.desktop.
+        #[cfg(target_os = "linux")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: "xdm-app".to_owned(),
+            ..Default::default()
+        },
         ..iced::window::Settings::default()
     }
 }
