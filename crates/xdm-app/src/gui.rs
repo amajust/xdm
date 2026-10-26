@@ -1833,7 +1833,9 @@ impl Gui {
 
         let error_line: Element<'_, Message> = match &self.modal_error {
             Some(err) => text(err.as_str()).size(12).color(palette::RED).into(),
-            None => text("").size(0).into(),
+            // A zero-height Space, not a zero-size text: cosmic-text panics
+            // on empty text with font size 0 ("line height cannot be 0").
+            None => Space::new().width(Length::Fill).height(Length::Fixed(0.0)).into(),
         };
         container(
             column![
