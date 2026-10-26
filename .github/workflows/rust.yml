@@ -5,13 +5,11 @@ name: Rust
 
 on:
   push:
+    # branches and tags are OR-ed. No `paths` filter here: a tag push on an
+    # existing commit has no commits to diff, so `paths` would silently drop
+    # release tag pushes. Concurrency + rust-cache keep the extra runs cheap.
     branches: [ rust-rewrite ]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain*'
-      - '.github/workflows/rust.yml'
+    tags: [ 'xdm-app-v*' ]
   pull_request:
     branches: [ rust-rewrite ]
   workflow_dispatch:
@@ -62,16 +60,59 @@ jobs:
         run: cargo test -p xdm-core -p xdm-app
       - name: Build (release)
         run: cargo build --release -p xdm-app
-      - name: Package (unix)
-        if: runner.os != 'Windows'
-        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path target/release/xdm-app.exe -DestinationPath xdm-app-${{ matrix.name }}.zip
+      - name: Package (tar.gz on every platform)
+        # Windows 10+ ships bsdtar, which handles -z natively; keeping one
+        # archive format across platforms simplifies scripting.
+        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: xdm-app-${{ matrix.name }}
           path: xdm-app-${{ matrix.name }}.*
           if-no-files-found: error
+
+  # Tag releases: pushing a tag `xdm-app-v*` builds the matrix and attaches
+  # the packages to a GitHub release. Separate from the legacy Java pipeline
+  # (binaries.yml, triggered by `v*` tags on master).
+  release:
+    name: release (${{ matrix.name }})
+    if: startsWith(github.ref, 'refs/tags/xdm-app-v')
+    needs: [ clippy ]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64 }
+          - { os: macos-latest, name: macos-aarch64 }
+          - { os: windows-latest, name: windows-x86_64 }
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
+      - name: Tests
+        run: cargo test -p xdm-core -p xdm-app
+      - name: Build (release)
+        run: cargo build --release -p xdm-app
+      - name: Package (tar.gz on every platform)
+        # Windows 10+ ships bsdtar, which handles -z natively; keeping one
+        # archive format across platforms simplifies scripting.
+        run: tar czf xdm-app-${{ matrix.name }}.tar.gz -C target/release xdm-app${{ runner.os == 'Windows' && '.exe' || '' }}
+      # Three matrix jobs race to publish; create falls back to upload when
+      # a sibling already created the release.
+      - name: Attach to GitHub release
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "XDM Rust Rewrite $GITHUB_REF_NAME" \
+            --prerelease \
+            --notes "Cross-platform builds of the Rust rewrite." \
+            "xdm-app-${{ matrix.name }}.*" \
+            || gh release upload "$GITHUB_REF_NAME" --clobber "xdm-app-${{ matrix.name }}.*"
