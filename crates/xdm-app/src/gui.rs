@@ -2150,10 +2150,17 @@ fn wants_new_window(prog: &str) -> bool {
     matches!(prog, "dolphin" | "nautilus")
 }
 
-/// Is `prog` executable from PATH?
+/// Is `prog` executable from PATH? Windows requires the `.exe` suffix for
+/// the file probe (PATH lookup there also covers it via PATHEXT).
 fn in_path(prog: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|p| p.join(prog).is_file())
+        std::env::split_paths(&paths).any(|p| {
+            if cfg!(windows) {
+                p.join(format!("{prog}.exe")).is_file()
+            } else {
+                p.join(prog).is_file()
+            }
+        })
     })
 }
 
