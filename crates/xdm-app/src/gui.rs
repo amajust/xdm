@@ -280,6 +280,12 @@ pub enum Message {
     Resume(usize),
     Remove(usize),
     OpenFolder(usize),
+    /// Row action: ask to delete the row and its files from disk.
+    RowDelete(usize),
+    /// Delete dialog confirmed.
+    ConfirmDelete,
+    /// Delete dialog dismissed (backdrop / cancel).
+    CancelDelete,
     AutoRetry(usize),
     /// Result of the first-tick `window::latest()` lookup.
     GotWindowId(Option<Id>),
@@ -518,6 +524,11 @@ struct Gui {
     window_id: Option<Id>,
     /// The close button was pressed; show the minimize-to-tray dialog.
     confirm_quit: bool,
+    /// Validation message for the New-download dialog, shown under the
+    /// inputs; set when Add is pressed with an unusable link.
+    modal_error: Option<String>,
+    /// Row whose files the user asked to delete; shows the confirm card.
+    confirm_delete: Option<usize>,
     /// True while a modal dialog is up: the main layout renders with every
     /// color pre-dimmed (see [`shade`]) instead of under a translucent
     /// backdrop, which flickers under incremental software rendering.
@@ -541,6 +552,8 @@ impl Default for Gui {
                 removed: std::collections::HashSet::new(),
                 window_id: None,
                 confirm_quit: false,
+                modal_error: None,
+                confirm_delete: None,
                 dimmed: false,
             };
         };
@@ -557,6 +570,8 @@ impl Default for Gui {
             removed,
             window_id: None,
             confirm_quit: false,
+            modal_error: None,
+            confirm_delete: None,
             dimmed: false,
         }
     }
@@ -611,25 +626,33 @@ impl Gui {
         let task = match message {
             Message::UrlInput(s) => {
                 self.url = s;
+                self.modal_error = None;
                 Task::none()
             }
             Message::DestInput(s) => {
                 self.dest = s;
+                self.modal_error = None;
                 Task::none()
             }
             Message::NewDownload => {
                 self.modal_open = true;
+                self.modal_error = None;
                 Task::none()
             }
             Message::CancelModal => {
                 self.modal_open = false;
+                self.modal_error = None;
                 Task::none()
             }
             Message::Add => {
-                let url = self.url.trim().to_owned();
-                if url.is_empty() {
+                // Unusable link: surface why instead of silently doing
+                // nothing; typing again clears the message.
+                if let Some(err) = link_error(&self.url) {
+                    self.modal_error = Some(err.to_owned());
                     return Task::none();
                 }
+                self.modal_error = None;
+                let url = self.url.trim().to_owned();
                 let dest = destination(&url, &self.dest);
                 // A fresh add clears any earlier remove-tombstone for it.
                 self.removed.remove(dest.to_string_lossy().as_ref());
@@ -825,6 +848,45 @@ impl Gui {
                 }
                 Task::none()
             }
+            Message::RowDelete(i) => {
+                // An external row's files belong to another process; the
+                // button is disabled for those, this is just a guard.
+                if self.downloads.get(i).is_some_and(|it| !it.external) {
+                    self.confirm_delete = Some(i);
+                }
+                Task::none()
+            }
+            Message::CancelDelete => {
+                self.confirm_delete = None;
+                Task::none()
+            }
+            Message::ConfirmDelete => {
+                let Some(i) = self.confirm_delete.take() else {
+                    return Task::none();
+                };
+                if let Some(item) = self.downloads.get(i)
+                    && let Some(cancel) = &item.cancel
+                {
+                    cancel.cancel();
+                }
+                if self.selected == Some(i) {
+                    self.selected = None;
+                } else if self.selected.is_some_and(|s| s > i) {
+                    self.selected = self.selected.map(|s| s - 1);
+                }
+                let item = self.downloads.remove(i);
+                let dest = item.dest.clone();
+                let state_path = state_file_for(&item.dest);
+                // Tombstone the destination so the scanner cannot resurrect
+                // the row from the (possibly not yet deleted) state file.
+                self.removed.insert(dest.to_string_lossy().into_owned());
+                rt().spawn(async move {
+                    let _ = tokio::fs::remove_file(&dest).await;
+                    let _ = tokio::fs::remove_file(&state_path).await;
+                });
+                self.persist();
+                Task::none()
+            }
             Message::AutoRetry(i) => {
                 if let Some(item) = self.downloads.get_mut(i)
                     && item.retry_scheduled
@@ -838,7 +900,9 @@ impl Gui {
 
         // Every modal state change flows through here: keep the dim flag in
         // sync in one place instead of touching each match arm.
-        self.dimmed = self.modal_open || self.confirm_quit;
+        self.dimmed = self.modal_open
+            || self.confirm_quit
+            || self.confirm_delete.is_some();
         task
     }
 
@@ -846,6 +910,7 @@ impl Gui {
     /// by the tray's Show and the browser monitor's `/show`.
     fn show_window(&mut self) -> Task<Message> {
         self.confirm_quit = false;
+        self.confirm_delete = None;
         match self.window_id {
             // Already have a window (dialog open or window unused): just
             // raise it, never open a duplicate.
@@ -1157,6 +1222,13 @@ impl Gui {
         } else if self.modal_open {
             stack![mouse_area(layout).on_press(Message::CancelModal), self.modal_card()]
                 .into()
+        } else if self.confirm_delete.is_some() {
+            // Clicking anywhere outside the card cancels the delete dialog.
+            stack![
+                mouse_area(layout).on_press(Message::CancelDelete),
+                self.delete_card()
+            ]
+            .into()
         } else {
             layout.into()
         }
@@ -1481,14 +1553,26 @@ impl Gui {
             info = info.push(text(err.as_str()).size(11).color(shade(palette::RED, dim)));
         }
 
-        let side = column![text(status_label).size(12).color(
-            if selected {
-                shade(palette::WHITE, dim)
-            } else {
-                shade(status_color, dim)
-            }
-        )]
+        let can_delete = !item.external;
+        let side = column![
+            text(status_label).size(12).color(
+                if selected {
+                    shade(palette::WHITE, dim)
+                } else {
+                    shade(status_color, dim)
+                }
+            ),
+            // Per-row actions: open the destination folder, and delete the
+            // row together with its files (asks for confirmation).
+            row![
+                row_btn("Folder", true, Message::OpenFolder(i), dim),
+                row_btn("Delete", can_delete, Message::RowDelete(i), dim),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        ]
         .width(96)
+        .spacing(6)
         .align_x(Alignment::End);
 
         // Java XDM rows are flat white with a hairline divider underneath;
@@ -1628,9 +1712,75 @@ impl Gui {
         .into()
     }
 
+    fn delete_card(&self) -> Element<'_, Message> {
+        let name = self
+            .confirm_delete
+            .and_then(|i| self.downloads.get(i))
+            .map(|it| it.name.clone())
+            .unwrap_or_default();
+        container(
+            column![
+                text("Delete this download?").size(17).color(palette::DIALOG_TEXT),
+                text(format!(
+                    "\"{name}\" and its downloaded files will be removed from disk."
+                ))
+                .size(13)
+                .color(palette::DIALOG_DIM),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Cancel").size(13).color(palette::DIALOG_TEXT))
+                        .padding([7, 16])
+                        .style(|_: &Theme, status| {
+                            let bg = matches!(status, button::Status::Hovered)
+                                .then_some(palette::DIALOG_BORDER)
+                                .map(iced::Background::from);
+                            button::Style {
+                                background: bg,
+                                text_color: palette::DIALOG_TEXT,
+                                border: iced::Border {
+                                    color: palette::DIALOG_BORDER,
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
+                                ..button::Style::default()
+                            }
+                        })
+                        .on_press(Message::CancelDelete),
+                    button(text("Delete").size(13).color(palette::WHITE))
+                        .padding([7, 16])
+                        .style(|_: &Theme, _| button::Style {
+                            background: Some(palette::RED.into()),
+                            text_color: palette::WHITE,
+                            border: iced::Border {
+                                color: Color::TRANSPARENT,
+                                width: 0.0,
+                                radius: 4.0.into(),
+                            },
+                            ..button::Style::default()
+                        })
+                        .on_press(Message::ConfirmDelete),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(12),
+        )
+        .width(460)
+        .padding(22)
+        .style(|_| container::Style {
+            background: Some(palette::DIALOG_BG.into()),
+            border: iced::Border {
+                color: palette::DIALOG_BORDER,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+    }
+
     fn modal_card(&self) -> Element<'_, Message> {
-        let input_style = move |_: &Theme, _: text_input::Status| text_input::Style {
-            background: palette::DIALOG_INPUT.into(),
+        let input_style = move |_: &Theme, _: text_input::Status| text_input::Style {            background: palette::DIALOG_INPUT.into(),
             border: iced::Border {
                 color: palette::DIALOG_BORDER,
                 width: 1.0,
@@ -1642,6 +1792,10 @@ impl Gui {
             selection: iced::Color::from_rgba8(0x33, 0xB5, 0xE5, 0.35),
         };
 
+        let error_line: Element<'_, Message> = match &self.modal_error {
+            Some(err) => text(err.as_str()).size(12).color(palette::RED).into(),
+            None => text("").size(0).into(),
+        };
         container(
             column![
                 text("New download").size(17).color(palette::DIALOG_TEXT),
@@ -1655,6 +1809,7 @@ impl Gui {
                     .on_submit(Message::Add)
                     .size(13)
                     .style(input_style),
+                error_line,
                 row![
                     Space::new().width(Length::Fill),
                     button(text("Cancel").size(13).color(palette::DIALOG_DIM))
@@ -1875,6 +2030,73 @@ fn is_fresh(modified: SystemTime) -> Option<bool> {
     modified.elapsed().ok().map(|age| age < Duration::from_secs(10))
 }
 
+/// Small per-row action button (Folder / Delete); transparent until
+/// hovered, like the toolbar buttons.
+fn row_btn(
+    label: &'static str,
+    enabled: bool,
+    msg: Message,
+    dim: bool,
+) -> Element<'static, Message> {
+    button(text(label).size(10).color(shade(palette::DIALOG_TEXT, dim)))
+        .padding([3, 6])
+        .on_press_maybe(enabled.then_some(msg))
+        .style(move |_: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered if enabled => {
+                    Some(shade(palette::TOOLBAR_HOVER, dim).into())
+                }
+                button::Status::Pressed if enabled => {
+                    Some(shade(palette::TOOLBAR_PRESSED, dim).into())
+                }
+                _ => None,
+            };
+            let fg = if enabled {
+                shade(palette::DIALOG_TEXT, dim)
+            } else {
+                shade(palette::TEXT_DISABLED, dim)
+            };
+            button::Style {
+                background: bg,
+                text_color: fg,
+                border: iced::Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 6.0.into(),
+                },
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
+/// Sibling resume-state file for a download destination, mirroring the
+/// engine's naming in xdm-core (`http.rs`): `.<name>.xdm-state.json`.
+fn state_file_for(dest: &Path) -> PathBuf {
+    let state_name = format!(
+        ".{}.xdm-state.json",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("download")
+    );
+    dest.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(state_name)
+}
+
+/// Validation for the New-download dialog: `Some(reason)` when the link
+/// cannot be started, shown under the inputs.
+fn link_error(url: &str) -> Option<&'static str> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Some("The link is empty — paste a URL first.");
+    }
+    // The engine is HTTP(S) only; anything else would fail later with a
+    // less helpful error.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Some("That doesn't look like a link — expected http:// or https://");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,6 +2137,24 @@ mod tests {
         assert_eq!(badge_label("file.mkv"), "MKV");
         assert_eq!(badge_label("a.b.c"), "C");
         assert_eq!(badge_label("noext"), "FILE");
+    }
+
+    #[test]
+    fn link_error_flags_empty_and_bad_scheme() {
+        assert_eq!(link_error(""), Some("The link is empty — paste a URL first."));
+        assert_eq!(link_error("   "), Some("The link is empty — paste a URL first."));
+        assert!(link_error("example.com/file.zip").is_some());
+        assert!(link_error("ftp://example.com/f").is_some());
+        assert!(link_error("https://example.com/file.zip").is_none());
+        assert!(link_error("  https://example.com/f  ").is_none());
+    }
+
+    #[test]
+    fn state_file_matches_engine_naming() {
+        let s = state_file_for(Path::new("/home/u/Downloads/file.zip"));
+        assert_eq!(s, PathBuf::from("/home/u/Downloads/.file.zip.xdm-state.json"));
+        let s = state_file_for(Path::new("file.zip"));
+        assert_eq!(s, PathBuf::from(".file.zip.xdm-state.json"));
     }
 
     #[test]
