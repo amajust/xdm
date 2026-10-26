@@ -173,41 +173,30 @@ mod tray {
         }
     }
 
-    /// The tray icon: a dark XDM disc with the cyan download arrow.
+    /// The tray icon: the XDM logo as an ARGB32 pixmap (ksni expects
+    /// alpha-first bytes); 64 px is plenty, panels scale as needed.
     pub fn icon() -> Icon {
-        const S: i32 = 32;
-        let mut data = Vec::with_capacity((S * S * 4) as usize);
-        for y in 0..S {
-            for x in 0..S {
-                let (a, r, g, b) = pixel(x as f32, y as f32);
-                data.extend_from_slice(&[a, r, g, b]);
-            }
-        }
-        Icon {
-            width: S,
-            height: S,
-            data,
-        }
-    }
-
-    /// One pixel of [`icon`], as ARGB32 components (alpha, red, green, blue).
-    fn pixel(x: f32, y: f32) -> (u8, u8, u8, u8) {
-        let transparent = || (0u8, 0u8, 0u8, 0u8);
-        // Dark disc (toolbar color), slightly inset for the tray mask.
-        let dx = x - 15.5;
-        let dy = y - 15.5;
-        if dx * dx + dy * dy > 14.5 * 14.5 {
-            return transparent();
-        }
-        // Cyan download arrow: triangle tapering downward from y 8 to the
-        // apex at y 18, then a stem to y 24 (both centered on x 16.5).
-        let arrowhead = (8.0..18.0).contains(&y) && (x - 16.5).abs() <= 7.5 * ((18.0 - y) / 10.0);
-        let stem = (18.0..24.0).contains(&y) && (x - 16.5).abs() <= 5.5;
-        if arrowhead || stem {
-            (255, 0x33, 0xB5, 0xE5)
-        } else {
-            (255, 0x0E, 0x14, 0x19)
-        }
+        static PIXMAP: OnceLock<Icon> = OnceLock::new();
+        PIXMAP
+            .get_or_init(|| {
+                let rgba = image::load_from_memory(include_bytes!("../assets/xdm-logo-256.png"))
+                    .expect("bundled logo decodes")
+                    .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+                    .into_rgba8();
+                let data = rgba
+                    .into_raw()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|px| [px[3], px[0], px[1], px[2]])
+                    .collect();
+                Icon {
+                    width: 64,
+                    height: 64,
+                    data,
+                }
+            })
+            .clone()
     }
 }
 
@@ -227,8 +216,33 @@ fn window_settings() -> iced::window::Settings {
     iced::window::Settings {
         size: (1020, 640).into(),
         exit_on_close_request: false,
+        icon: app_icon(),
+        // iced defaults the application_id to an EMPTY string and passes it
+        // to winit unconditionally, which leaves the Wayland app_id (and the
+        // X11 class) blank — compositors then cannot resolve a taskbar icon
+        // by app_id at all. Set it explicitly to match xdm-app.desktop.
+        #[cfg(target_os = "linux")]
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: "xdm-app".to_owned(),
+            ..Default::default()
+        },
         ..iced::window::Settings::default()
     }
+}
+
+/// The window/taskbar icon, decoded once from the bundled logo. Windows,
+/// X11 and Wayland (xdg-toplevel-icon) use it for the taskbar; macOS
+/// ignores it — the Dock icon comes from an .app bundle (see packaging/).
+fn app_icon() -> Option<iced::window::Icon> {
+    static ICON: OnceLock<Option<iced::window::Icon>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let rgba = image::load_from_memory(include_bytes!("../assets/xdm-logo-256.png"))
+            .ok()?
+            .into_rgba8();
+        let (width, height) = rgba.dimensions();
+        iced::window::icon::from_rgba(rgba.into_raw(), width, height).ok()
+    })
+    .clone()
 }
 
 pub fn run() -> iced::Result {
@@ -2350,21 +2364,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn tray_icon_is_arbg32_disc_with_arrow() {
+    fn tray_icon_is_64px_argb32_logo() {
         let icon = tray::icon();
-        assert_eq!((icon.width, icon.height), (32, 32));
-        assert_eq!(icon.data.len(), 32 * 32 * 4);
+        assert_eq!((icon.width, icon.height), (64, 64));
+        assert_eq!(icon.data.len(), 64 * 64 * 4);
 
-        // Pixel 0 (corner): outside the disc, fully transparent.
-        assert_eq!(&icon.data[..4], &[0, 0, 0, 0]);
-        // A disc point away from the arrow: dark background.
-        let bg = (5 * 4) + 16 * 4 * 32;
-        assert_eq!(&icon.data[bg..bg + 4], &[255, 0x0E, 0x14, 0x19]);
-        // Arrowhead pixel and stem pixel: cyan.
-        let arrow = (9 * 4) + 8 * 4 * 32;
-        assert_eq!(&icon.data[arrow..arrow + 4], &[255, 0x33, 0xB5, 0xE5]);
-        let stem = (12 * 4) + 20 * 4 * 32;
-        assert_eq!(&icon.data[stem..stem + 4], &[255, 0x33, 0xB5, 0xE5]);
+        // The logo pixmap is ARGB32 (alpha-first) and has visible content:
+        // not every pixel is transparent, and some pixel is fully opaque.
+        assert!(icon.data.as_chunks::<4>().0.iter().any(|px| px[0] == 255));
+        assert!(icon.data.as_chunks::<4>().0.iter().any(|px| px[0] != 0));
     }
 
     #[test]
