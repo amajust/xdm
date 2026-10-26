@@ -2276,7 +2276,9 @@ mod tests {
         assert!(fm_candidates("unknown-de").contains(&"xdg-open"));
         assert!(wants_new_window("dolphin") && wants_new_window("nautilus"));
         assert!(!wants_new_window("thunar"));
-        assert!(in_path("sh"));
+        // A shell every platform's CI runner has on PATH.
+        let known_shell = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(in_path(known_shell));
         assert!(!in_path("not-a-real-binary-xyz"));
     }
 
