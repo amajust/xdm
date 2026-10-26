@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use iced::font::{Font, Weight};
 use iced::widget::{
     button, column, container, mouse_area, progress_bar, rule, row, scrollable, space::Space,
-    stack, text, text_input,
+    stack, svg, text, text_input,
 };
 use iced::window::Id;
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
@@ -278,8 +278,13 @@ pub enum Message {
     Category(Category),
     Pause(usize),
     Resume(usize),
-    Remove(usize),
     OpenFolder(usize),
+    /// Row action: ask to delete the row and its files from disk.
+    RowDelete(usize),
+    /// Delete dialog confirmed.
+    ConfirmDelete,
+    /// Delete dialog dismissed (backdrop / cancel).
+    CancelDelete,
     AutoRetry(usize),
     /// Result of the first-tick `window::latest()` lookup.
     GotWindowId(Option<Id>),
@@ -518,6 +523,11 @@ struct Gui {
     window_id: Option<Id>,
     /// The close button was pressed; show the minimize-to-tray dialog.
     confirm_quit: bool,
+    /// Validation message for the New-download dialog, shown under the
+    /// inputs; set when Add is pressed with an unusable link.
+    modal_error: Option<String>,
+    /// Row whose files the user asked to delete; shows the confirm card.
+    confirm_delete: Option<usize>,
     /// True while a modal dialog is up: the main layout renders with every
     /// color pre-dimmed (see [`shade`]) instead of under a translucent
     /// backdrop, which flickers under incremental software rendering.
@@ -541,6 +551,8 @@ impl Default for Gui {
                 removed: std::collections::HashSet::new(),
                 window_id: None,
                 confirm_quit: false,
+                modal_error: None,
+                confirm_delete: None,
                 dimmed: false,
             };
         };
@@ -557,6 +569,8 @@ impl Default for Gui {
             removed,
             window_id: None,
             confirm_quit: false,
+            modal_error: None,
+            confirm_delete: None,
             dimmed: false,
         }
     }
@@ -611,25 +625,33 @@ impl Gui {
         let task = match message {
             Message::UrlInput(s) => {
                 self.url = s;
+                self.modal_error = None;
                 Task::none()
             }
             Message::DestInput(s) => {
                 self.dest = s;
+                self.modal_error = None;
                 Task::none()
             }
             Message::NewDownload => {
                 self.modal_open = true;
+                self.modal_error = None;
                 Task::none()
             }
             Message::CancelModal => {
                 self.modal_open = false;
+                self.modal_error = None;
                 Task::none()
             }
             Message::Add => {
-                let url = self.url.trim().to_owned();
-                if url.is_empty() {
+                // Unusable link: surface why instead of silently doing
+                // nothing; typing again clears the message.
+                if let Some(err) = link_error(&self.url) {
+                    self.modal_error = Some(err.to_owned());
                     return Task::none();
                 }
+                self.modal_error = None;
+                let url = self.url.trim().to_owned();
                 let dest = destination(&url, &self.dest);
                 // A fresh add clears any earlier remove-tombstone for it.
                 self.removed.remove(dest.to_string_lossy().as_ref());
@@ -793,22 +815,6 @@ impl Gui {
                 }
                 Task::none()
             }
-            Message::Remove(i) => {
-                if let Some(item) = self.downloads.get(i)
-                    && let Some(cancel) = &item.cancel
-                {
-                    cancel.cancel();
-                }
-                if self.selected == Some(i) {
-                    self.selected = None;
-                }
-                let item = self.downloads.remove(i);
-                // The engine's state file may outlive this removal; remember
-                // the destination so the scanner cannot resurrect the row.
-                self.removed.insert(item.dest.to_string_lossy().into_owned());
-                self.persist();
-                Task::none()
-            }
             Message::OpenFolder(i) => {
                 if let Some(item) = self.downloads.get(i) {
                     let dir = item
@@ -816,13 +822,59 @@ impl Gui {
                         .parent()
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| PathBuf::from("."));
+                    match open_dir_cmd(&dir) {
+                        Some(mut cmd) => {
+                            rt().spawn(async move {
+                                match cmd.status().await {
+                                    Ok(status) if status.success() => {}
+                                    Ok(status) => {
+                                        eprintln!("xdm-app: file manager exited {status}")
+                                    }
+                                    Err(e) => eprintln!("xdm-app: file manager failed: {e}"),
+                                }
+                            });
+                        }
+                        None => eprintln!("xdm-app: no file manager found for {dir:?}"),
+                    }
+                }
+                Task::none()
+            }
+            Message::RowDelete(i) => {
+                self.confirm_delete = Some(i);
+                Task::none()
+            }
+            Message::CancelDelete => {
+                self.confirm_delete = None;
+                Task::none()
+            }
+            Message::ConfirmDelete => {
+                let Some(i) = self.confirm_delete.take() else {
+                    return Task::none();
+                };
+                if let Some(item) = self.downloads.get(i)
+                    && let Some(cancel) = &item.cancel
+                {
+                    cancel.cancel();
+                }
+                if self.selected == Some(i) {
+                    self.selected = None;
+                } else if self.selected.is_some_and(|s| s > i) {
+                    self.selected = self.selected.map(|s| s - 1);
+                }
+                let item = self.downloads.remove(i);
+                if !item.external {
+                    let dest = item.dest.clone();
+                    let state_path = state_file_for(&item.dest);
                     rt().spawn(async move {
-                        let _ = tokio::process::Command::new("xdg-open")
-                            .arg(dir)
-                            .status()
-                            .await;
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        let _ = tokio::fs::remove_file(&state_path).await;
                     });
                 }
+                // Tombstone the destination so the scanner cannot resurrect
+                // the row from a (possibly not yet deleted) state file.
+                self.removed
+                    .insert(item.dest.to_string_lossy().into_owned());
+                self.persist();
                 Task::none()
             }
             Message::AutoRetry(i) => {
@@ -838,7 +890,9 @@ impl Gui {
 
         // Every modal state change flows through here: keep the dim flag in
         // sync in one place instead of touching each match arm.
-        self.dimmed = self.modal_open || self.confirm_quit;
+        self.dimmed = self.modal_open
+            || self.confirm_quit
+            || self.confirm_delete.is_some();
         task
     }
 
@@ -846,6 +900,7 @@ impl Gui {
     /// by the tray's Show and the browser monitor's `/show`.
     fn show_window(&mut self) -> Task<Message> {
         self.confirm_quit = false;
+        self.confirm_delete = None;
         match self.window_id {
             // Already have a window (dialog open or window unused): just
             // raise it, never open a duplicate.
@@ -1157,6 +1212,13 @@ impl Gui {
         } else if self.modal_open {
             stack![mouse_area(layout).on_press(Message::CancelModal), self.modal_card()]
                 .into()
+        } else if self.confirm_delete.is_some() {
+            // Clicking anywhere outside the card cancels the delete dialog.
+            stack![
+                mouse_area(layout).on_press(Message::CancelDelete),
+                self.delete_card()
+            ]
+            .into()
         } else {
             layout.into()
         }
@@ -1168,7 +1230,6 @@ impl Gui {
         let sel_state = sel.and_then(|i| self.downloads.get(i)).map(|it| it.state);
         let can_resume = matches!(sel_state, Some(State::Paused) | Some(State::Failed));
         let can_pause = sel_state == Some(State::Running);
-        let can_target = sel.is_some();
 
         let divider = || {
             container("").width(1).height(22).style(move |_| container::Style {
@@ -1182,9 +1243,6 @@ impl Gui {
             divider(),
             tool_btn("Resume", can_resume, Message::Resume(sel.unwrap_or(0)), dim),
             tool_btn("Pause", can_pause, Message::Pause(sel.unwrap_or(0)), dim),
-            divider(),
-            tool_btn("Remove", can_target, Message::Remove(sel.unwrap_or(0)), dim),
-            tool_btn("Folder", can_target, Message::OpenFolder(sel.unwrap_or(0)), dim),
         ]
         .padding([6, 10])
         .spacing(2)
@@ -1481,14 +1539,25 @@ impl Gui {
             info = info.push(text(err.as_str()).size(11).color(shade(palette::RED, dim)));
         }
 
-        let side = column![text(status_label).size(12).color(
-            if selected {
-                shade(palette::WHITE, dim)
-            } else {
-                shade(status_color, dim)
-            }
-        )]
-        .width(96)
+        let side = column![
+            text(status_label).size(12).color(
+                if selected {
+                    shade(palette::WHITE, dim)
+                } else {
+                    shade(status_color, dim)
+                }
+            ),
+            // Per-row actions: open the destination folder, and delete the
+            // row together with its files (asks for confirmation).
+            row![
+                row_btn("Folder", &FOLDER_ICON, Message::OpenFolder(i), dim, selected),
+                row_btn("Delete", &DELETE_ICON, Message::RowDelete(i), dim, selected),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .width(Length::Shrink)
+        .spacing(8)
         .align_x(Alignment::End);
 
         // Java XDM rows are flat white with a hairline divider underneath;
@@ -1628,9 +1697,78 @@ impl Gui {
         .into()
     }
 
+    fn delete_card(&self) -> Element<'_, Message> {
+        let (name, external) = self
+            .confirm_delete
+            .and_then(|i| self.downloads.get(i))
+            .map(|it| (it.name.clone(), it.external))
+            .unwrap_or_default();
+        let detail = if external {
+            format!("\"{name}\" will be removed from the list (its files are managed by another process).")
+        } else {
+            format!("\"{name}\" and its downloaded files will be removed from disk.")
+        };
+        container(
+            column![
+                text("Delete this download?").size(17).color(palette::DIALOG_TEXT),
+                text(detail)
+                .size(13)
+                .color(palette::DIALOG_DIM),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Cancel").size(13).color(palette::DIALOG_TEXT))
+                        .padding([7, 16])
+                        .style(|_: &Theme, status| {
+                            let bg = matches!(status, button::Status::Hovered)
+                                .then_some(palette::DIALOG_BORDER)
+                                .map(iced::Background::from);
+                            button::Style {
+                                background: bg,
+                                text_color: palette::DIALOG_TEXT,
+                                border: iced::Border {
+                                    color: palette::DIALOG_BORDER,
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
+                                ..button::Style::default()
+                            }
+                        })
+                        .on_press(Message::CancelDelete),
+                    button(text("Delete").size(13).color(palette::WHITE))
+                        .padding([7, 16])
+                        .style(|_: &Theme, _| button::Style {
+                            background: Some(palette::RED.into()),
+                            text_color: palette::WHITE,
+                            border: iced::Border {
+                                color: Color::TRANSPARENT,
+                                width: 0.0,
+                                radius: 4.0.into(),
+                            },
+                            ..button::Style::default()
+                        })
+                        .on_press(Message::ConfirmDelete),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(12),
+        )
+        .width(460)
+        .padding(22)
+        .style(|_| container::Style {
+            background: Some(palette::DIALOG_BG.into()),
+            border: iced::Border {
+                color: palette::DIALOG_BORDER,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+    }
+
     fn modal_card(&self) -> Element<'_, Message> {
-        let input_style = move |_: &Theme, _: text_input::Status| text_input::Style {
-            background: palette::DIALOG_INPUT.into(),
+        let input_style = move |_: &Theme, _: text_input::Status| text_input::Style {            background: palette::DIALOG_INPUT.into(),
             border: iced::Border {
                 color: palette::DIALOG_BORDER,
                 width: 1.0,
@@ -1642,6 +1780,10 @@ impl Gui {
             selection: iced::Color::from_rgba8(0x33, 0xB5, 0xE5, 0.35),
         };
 
+        let error_line: Element<'_, Message> = match &self.modal_error {
+            Some(err) => text(err.as_str()).size(12).color(palette::RED).into(),
+            None => text("").size(0).into(),
+        };
         container(
             column![
                 text("New download").size(17).color(palette::DIALOG_TEXT),
@@ -1655,6 +1797,7 @@ impl Gui {
                     .on_submit(Message::Add)
                     .size(13)
                     .style(input_style),
+                error_line,
                 row![
                     Space::new().width(Length::Fill),
                     button(text("Cancel").size(13).color(palette::DIALOG_DIM))
@@ -1875,6 +2018,166 @@ fn is_fresh(modified: SystemTime) -> Option<bool> {
     modified.elapsed().ok().map(|age| age < Duration::from_secs(10))
 }
 
+/// Monochrome action icons (Material Design), recolored per state via the
+/// svg widget's style.
+static FOLDER_ICON: std::sync::LazyLock<svg::Handle> = std::sync::LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!("../assets/folder.svg").as_slice())
+});
+static DELETE_ICON: std::sync::LazyLock<svg::Handle> = std::sync::LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!("../assets/delete.svg").as_slice())
+});
+
+/// Small per-row action button (Folder / Delete): an icon plus label in a
+/// light chip that stays visible on the white rows; turns translucent white
+/// on selected rows (accent background).
+fn row_btn(
+    label: &'static str,
+    icon: &'static svg::Handle,
+    msg: Message,
+    dim: bool,
+    selected: bool,
+) -> Element<'static, Message> {
+    let (fg, bg, border) = if selected {
+        (palette::WHITE, Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.22), Color::TRANSPARENT)
+    } else {
+        (palette::TEXT_DIM, palette::SIDEBAR_ACTIVE, Color::from_rgb8(0xD9, 0xD9, 0xD9))
+    };
+    let (fg, bg, border) = (shade(fg, dim), shade(bg, dim), shade(border, dim));
+    let fg_icon = fg;
+    button(
+        row![
+            svg(icon.clone())
+                .width(Length::Fixed(13.0))
+                .height(Length::Fixed(13.0))
+                .style(move |_: &Theme, _: svg::Status| svg::Style {
+                    color: Some(fg_icon),
+                }),
+            text(label).size(11).color(fg),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center),
+    )
+    .padding([4, 9])
+    .on_press(msg)
+    .style(move |_: &Theme, status| {
+        let bg = match status {
+            button::Status::Hovered => shade(Color::from_rgb8(0xE2, 0xE2, 0xE2), dim),
+            _ => bg,
+        };
+        button::Style {
+            background: Some(bg.into()),
+            text_color: fg,
+            border: iced::Border {
+                color: border,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
+/// Preferred file managers per desktop environment, most specific first;
+/// `xdg-open` is always the last-resort fallback.
+fn fm_candidates(de: &str) -> Vec<&'static str> {
+    let d = de.to_ascii_uppercase();
+    let mut list: Vec<&'static str> = if d.contains("KDE") {
+        vec!["dolphin"]
+    } else if d.contains("CINNAMON") {
+        vec!["nemo", "nautilus"]
+    } else if d.contains("XFCE") {
+        vec!["thunar"]
+    } else if d.contains("MATE") {
+        vec!["caja"]
+    } else if d.contains("GNOME")
+        || d.contains("UNITY")
+        || d.contains("BUDGIE")
+        || d.contains("COSMIC")
+        || d.contains("POP")
+    {
+        vec!["nautilus"]
+    } else if d.contains("LXQT") {
+        vec!["pcmanfm-qt"]
+    } else {
+        Vec::new()
+    };
+    list.push("xdg-open");
+    list
+}
+
+/// `dolphin`/`nautilus` route through a single instance that may swallow
+/// the request when launched from a background process (observed on KDE);
+/// asking for a new window goes through a fresh process instead.
+fn wants_new_window(prog: &str) -> bool {
+    matches!(prog, "dolphin" | "nautilus")
+}
+
+/// Is `prog` executable from PATH?
+fn in_path(prog: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|p| p.join(prog).is_file())
+    })
+}
+
+/// Builds the command that opens `dir` in the platform's file manager.
+fn open_dir_cmd(dir: &Path) -> Option<tokio::process::Command> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = tokio::process::Command::new("open");
+        cmd.arg(dir);
+        return Some(cmd);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = tokio::process::Command::new("explorer");
+        cmd.arg(dir);
+        return Some(cmd);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let de = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        for prog in fm_candidates(&de) {
+            if in_path(prog) {
+                let mut cmd = tokio::process::Command::new(prog);
+                if wants_new_window(prog) {
+                    cmd.arg("--new-window");
+                }
+                cmd.arg(dir);
+                return Some(cmd);
+            }
+        }
+        None
+    }
+}
+
+/// Sibling resume-state file for a download destination, mirroring the
+/// engine's naming in xdm-core (`http.rs`): `.<name>.xdm-state.json`.
+fn state_file_for(dest: &Path) -> PathBuf {
+    let state_name = format!(
+        ".{}.xdm-state.json",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("download")
+    );
+    dest.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(state_name)
+}
+
+/// Validation for the New-download dialog: `Some(reason)` when the link
+/// cannot be started, shown under the inputs.
+fn link_error(url: &str) -> Option<&'static str> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Some("The link is empty — paste a URL first.");
+    }
+    // The engine is HTTP(S) only; anything else would fail later with a
+    // less helpful error.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Some("That doesn't look like a link — expected http:// or https://");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,6 +2218,37 @@ mod tests {
         assert_eq!(badge_label("file.mkv"), "MKV");
         assert_eq!(badge_label("a.b.c"), "C");
         assert_eq!(badge_label("noext"), "FILE");
+    }
+
+    #[test]
+    fn link_error_flags_empty_and_bad_scheme() {
+        assert_eq!(link_error(""), Some("The link is empty — paste a URL first."));
+        assert_eq!(link_error("   "), Some("The link is empty — paste a URL first."));
+        assert!(link_error("example.com/file.zip").is_some());
+        assert!(link_error("ftp://example.com/f").is_some());
+        assert!(link_error("https://example.com/file.zip").is_none());
+        assert!(link_error("  https://example.com/f  ").is_none());
+    }
+
+    #[test]
+    fn fm_candidates_prefer_desktop_manager_with_xdg_open_fallback() {
+        assert_eq!(fm_candidates("KDE").first(), Some(&"dolphin"));
+        assert_eq!(fm_candidates("GNOME:gnome").first(), Some(&"nautilus"));
+        assert_eq!(fm_candidates("X-Cinnamon").first(), Some(&"nemo"));
+        assert!(fm_candidates("KDE").contains(&"xdg-open"));
+        assert!(fm_candidates("unknown-de").contains(&"xdg-open"));
+        assert!(wants_new_window("dolphin") && wants_new_window("nautilus"));
+        assert!(!wants_new_window("thunar"));
+        assert!(in_path("sh"));
+        assert!(!in_path("not-a-real-binary-xyz"));
+    }
+
+    #[test]
+    fn state_file_matches_engine_naming() {
+        let s = state_file_for(Path::new("/home/u/Downloads/file.zip"));
+        assert_eq!(s, PathBuf::from("/home/u/Downloads/.file.zip.xdm-state.json"));
+        let s = state_file_for(Path::new("file.zip"));
+        assert_eq!(s, PathBuf::from(".file.zip.xdm-state.json"));
     }
 
     #[test]
