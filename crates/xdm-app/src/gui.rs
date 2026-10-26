@@ -822,12 +822,20 @@ impl Gui {
                         .parent()
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| PathBuf::from("."));
-                    rt().spawn(async move {
-                        let _ = tokio::process::Command::new("xdg-open")
-                            .arg(dir)
-                            .status()
-                            .await;
-                    });
+                    match open_dir_cmd(&dir) {
+                        Some(mut cmd) => {
+                            rt().spawn(async move {
+                                match cmd.status().await {
+                                    Ok(status) if status.success() => {}
+                                    Ok(status) => {
+                                        eprintln!("xdm-app: file manager exited {status}")
+                                    }
+                                    Err(e) => eprintln!("xdm-app: file manager failed: {e}"),
+                                }
+                            });
+                        }
+                        None => eprintln!("xdm-app: no file manager found for {dir:?}"),
+                    }
                 }
                 Task::none()
             }
@@ -2070,6 +2078,79 @@ fn row_btn(
     .into()
 }
 
+/// Preferred file managers per desktop environment, most specific first;
+/// `xdg-open` is always the last-resort fallback.
+fn fm_candidates(de: &str) -> Vec<&'static str> {
+    let d = de.to_ascii_uppercase();
+    let mut list: Vec<&'static str> = if d.contains("KDE") {
+        vec!["dolphin"]
+    } else if d.contains("CINNAMON") {
+        vec!["nemo", "nautilus"]
+    } else if d.contains("XFCE") {
+        vec!["thunar"]
+    } else if d.contains("MATE") {
+        vec!["caja"]
+    } else if d.contains("GNOME")
+        || d.contains("UNITY")
+        || d.contains("BUDGIE")
+        || d.contains("COSMIC")
+        || d.contains("POP")
+    {
+        vec!["nautilus"]
+    } else if d.contains("LXQT") {
+        vec!["pcmanfm-qt"]
+    } else {
+        Vec::new()
+    };
+    list.push("xdg-open");
+    list
+}
+
+/// `dolphin`/`nautilus` route through a single instance that may swallow
+/// the request when launched from a background process (observed on KDE);
+/// asking for a new window goes through a fresh process instead.
+fn wants_new_window(prog: &str) -> bool {
+    matches!(prog, "dolphin" | "nautilus")
+}
+
+/// Is `prog` executable from PATH?
+fn in_path(prog: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|p| p.join(prog).is_file())
+    })
+}
+
+/// Builds the command that opens `dir` in the platform's file manager.
+fn open_dir_cmd(dir: &Path) -> Option<tokio::process::Command> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = tokio::process::Command::new("open");
+        cmd.arg(dir);
+        return Some(cmd);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = tokio::process::Command::new("explorer");
+        cmd.arg(dir);
+        return Some(cmd);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let de = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        for prog in fm_candidates(&de) {
+            if in_path(prog) {
+                let mut cmd = tokio::process::Command::new(prog);
+                if wants_new_window(prog) {
+                    cmd.arg("--new-window");
+                }
+                cmd.arg(dir);
+                return Some(cmd);
+            }
+        }
+        None
+    }
+}
+
 /// Sibling resume-state file for a download destination, mirroring the
 /// engine's naming in xdm-core (`http.rs`): `.<name>.xdm-state.json`.
 fn state_file_for(dest: &Path) -> PathBuf {
@@ -2147,6 +2228,19 @@ mod tests {
         assert!(link_error("ftp://example.com/f").is_some());
         assert!(link_error("https://example.com/file.zip").is_none());
         assert!(link_error("  https://example.com/f  ").is_none());
+    }
+
+    #[test]
+    fn fm_candidates_prefer_desktop_manager_with_xdg_open_fallback() {
+        assert_eq!(fm_candidates("KDE").first(), Some(&"dolphin"));
+        assert_eq!(fm_candidates("GNOME:gnome").first(), Some(&"nautilus"));
+        assert_eq!(fm_candidates("X-Cinnamon").first(), Some(&"nemo"));
+        assert!(fm_candidates("KDE").contains(&"xdg-open"));
+        assert!(fm_candidates("unknown-de").contains(&"xdg-open"));
+        assert!(wants_new_window("dolphin") && wants_new_window("nautilus"));
+        assert!(!wants_new_window("thunar"));
+        assert!(in_path("sh"));
+        assert!(!in_path("not-a-real-binary-xyz"));
     }
 
     #[test]
