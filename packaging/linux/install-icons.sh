@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Regenerates every icon the app needs from the single source of truth:
-#   crates/xdm-app/assets/xdm-logo-256.png   <- replace this file with your logo
+#   crates/xdm-app/assets/xdm-rust-logo.png   <- replace this file with your logo
 #
 # Produces:
+#   - a trimmed, centered 256 px copy the binaries embed (xdm-logo-256.png)
 #   - the multi-size Windows .ico (embedded into the exe at build time)
 #   - the hicolor PNGs + .desktop entry for the Linux taskbar/dock
 #
@@ -10,21 +11,28 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# Master logo (any size >= 256 px works); the app embeds a 256 px copy.
 master="$repo_root/crates/xdm-app/assets/xdm-rust-logo.png"
 logo="$repo_root/crates/xdm-app/assets/xdm-logo-256.png"
 
 [ -f "$master" ] || { echo "missing $master" >&2; exit 1; }
-
-# 0. 256 px copy the binaries embed (keeps the exe small and startup fast).
-magick "$master" -resize 256x256 "$logo"
 command -v magick >/dev/null 2>&1 || { echo "ImageMagick (magick) is required" >&2; exit 1; }
 
+# 0. Trimmed, centered square base at 512 px. The fuzz cut removes the
+#    soft glow/shadow padding around the artwork (a zero-fuzz trim only
+#    removes fully transparent pixels, which made the icon render small);
+#    the 480/512 resize keeps a small breathing margin.
+base="$(mktemp --suffix=.png)"
+magick "$master" -alpha set -fuzz 2% -trim +repage -resize 480x480 \
+    -background none -gravity center -extent 512x512 "$base"
+
 # 1. Windows .ico (explorer/taskbar icon embedded in the exe).
-magick "$logo" -define icon:auto-resize=256,128,64,48,32,24,16 \
+magick "$base" -define icon:auto-resize=256,128,64,48,32,24,16 \
     "$repo_root/crates/xdm-app/assets/xdm-app.ico"
 
-# 2. Linux: hicolor PNGs so the `xdm-app` app_id resolves in the taskbar.
+# 2. 256 px copy the binaries embed (keeps the exe small and startup fast).
+magick "$base" -resize 256x256 "$logo"
+
+# 3. Linux: hicolor PNGs so the `xdm-app` app_id resolves in the taskbar.
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 icon_dir="$data_home/icons/hicolor"
 apps_dir="$data_home/applications"
@@ -32,10 +40,11 @@ apps_dir="$data_home/applications"
 for size in 16 24 32 48 64 128 256; do
     dir="$icon_dir/${size}x${size}/apps"
     mkdir -p "$dir"
-    magick "$logo" -resize "${size}x${size}" "$dir/xdm-app.png"
+    magick "$base" -resize "${size}x${size}" "$dir/xdm-app.png"
 done
 mkdir -p "$icon_dir/scalable/apps"
-cp "$logo" "$icon_dir/scalable/apps/xdm-app.png"
+cp "$base" "$icon_dir/scalable/apps/xdm-app.png"
+rm -f "$base"
 
 mkdir -p "$apps_dir"
 cp "$repo_root/packaging/linux/xdm-app.desktop" "$apps_dir/"
