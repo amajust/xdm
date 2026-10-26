@@ -862,7 +862,10 @@ impl Gui {
                     self.selected = self.selected.map(|s| s - 1);
                 }
                 let item = self.downloads.remove(i);
-                if !item.external {
+                // Delete the files for external rows too: the user asked for
+                // it, and an abandoned download's files are just disk usage.
+                // The wait/retry below rides out a concurrent writer.
+                {
                     let status = item.status.clone();
                     let dest = item.dest.clone();
                     let state_path = state_file_for(&item.dest);
@@ -1735,16 +1738,13 @@ impl Gui {
     }
 
     fn delete_card(&self) -> Element<'_, Message> {
-        let (name, external) = self
+        let name = self
             .confirm_delete
             .and_then(|i| self.downloads.get(i))
-            .map(|it| (it.name.clone(), it.external))
+            .map(|it| it.name.clone())
             .unwrap_or_default();
-        let detail = if external {
-            format!("\"{name}\" will be removed from the list (its files are managed by another process).")
-        } else {
-            format!("\"{name}\" and its downloaded files will be removed from disk.")
-        };
+        let detail =
+            format!("\"{name}\" and its downloaded files will be removed from disk.");
         container(
             column![
                 text("Delete this download?").size(17).color(palette::DIALOG_TEXT),
