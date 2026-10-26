@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use iced::font::{Font, Weight};
 use iced::widget::{
     button, column, container, mouse_area, progress_bar, rule, row, scrollable, space::Space,
-    stack, text, text_input,
+    stack, svg, text, text_input,
 };
 use iced::window::Id;
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
@@ -1542,8 +1542,8 @@ impl Gui {
             // Per-row actions: open the destination folder, and delete the
             // row together with its files (asks for confirmation).
             row![
-                row_btn("Folder", true, Message::OpenFolder(i), dim),
-                row_btn("Delete", true, Message::RowDelete(i), dim),
+                row_btn("Folder", &FOLDER_ICON, Message::OpenFolder(i), dim, selected),
+                row_btn("Delete", &DELETE_ICON, Message::RowDelete(i), dim, selected),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
@@ -2010,44 +2010,64 @@ fn is_fresh(modified: SystemTime) -> Option<bool> {
     modified.elapsed().ok().map(|age| age < Duration::from_secs(10))
 }
 
-/// Small per-row action button (Folder / Delete); transparent until
-/// hovered, like the toolbar buttons.
+/// Monochrome action icons (Material Design), recolored per state via the
+/// svg widget's style.
+static FOLDER_ICON: std::sync::LazyLock<svg::Handle> = std::sync::LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!("../assets/folder.svg").as_slice())
+});
+static DELETE_ICON: std::sync::LazyLock<svg::Handle> = std::sync::LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!("../assets/delete.svg").as_slice())
+});
+
+/// Small per-row action button (Folder / Delete): an icon plus label in a
+/// light chip that stays visible on the white rows; turns translucent white
+/// on selected rows (accent background).
 fn row_btn(
     label: &'static str,
-    enabled: bool,
+    icon: &'static svg::Handle,
     msg: Message,
     dim: bool,
+    selected: bool,
 ) -> Element<'static, Message> {
-    button(text(label).size(11).color(shade(palette::DIALOG_TEXT, dim)))
-        .padding([4, 9])
-        .on_press_maybe(enabled.then_some(msg))
-        .style(move |_: &Theme, status| {
-            let bg = match status {
-                button::Status::Hovered if enabled => {
-                    Some(shade(palette::TOOLBAR_HOVER, dim).into())
-                }
-                button::Status::Pressed if enabled => {
-                    Some(shade(palette::TOOLBAR_PRESSED, dim).into())
-                }
-                _ => None,
-            };
-            let fg = if enabled {
-                shade(palette::DIALOG_TEXT, dim)
-            } else {
-                shade(palette::TEXT_DISABLED, dim)
-            };
-            button::Style {
-                background: bg,
-                text_color: fg,
-                border: iced::Border {
-                    color: Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                ..button::Style::default()
-            }
-        })
-        .into()
+    let (fg, bg, border) = if selected {
+        (palette::WHITE, Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.22), Color::TRANSPARENT)
+    } else {
+        (palette::TEXT_DIM, palette::SIDEBAR_ACTIVE, Color::from_rgb8(0xD9, 0xD9, 0xD9))
+    };
+    let (fg, bg, border) = (shade(fg, dim), shade(bg, dim), shade(border, dim));
+    let fg_icon = fg;
+    button(
+        row![
+            svg(icon.clone())
+                .width(Length::Fixed(13.0))
+                .height(Length::Fixed(13.0))
+                .style(move |_: &Theme, _: svg::Status| svg::Style {
+                    color: Some(fg_icon),
+                }),
+            text(label).size(11).color(fg),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center),
+    )
+    .padding([4, 9])
+    .on_press(msg)
+    .style(move |_: &Theme, status| {
+        let bg = match status {
+            button::Status::Hovered => shade(Color::from_rgb8(0xE2, 0xE2, 0xE2), dim),
+            _ => bg,
+        };
+        button::Style {
+            background: Some(bg.into()),
+            text_color: fg,
+            border: iced::Border {
+                color: border,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
 }
 
 /// Sibling resume-state file for a download destination, mirroring the
