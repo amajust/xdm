@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const src = path.resolve(__dirname, '../../../xdm-app/src/main/resources/lang');
+const src = path.resolve(__dirname, '../../../translations');
 const dest = path.resolve(__dirname, '../public/lang');
 
 if (!fs.existsSync(path.join(src, 'en.txt'))) {

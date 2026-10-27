@@ -3,7 +3,7 @@ import path from 'path';
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-const LANG_DIR = path.resolve(__dirname, '../../../xdm-app/src/main/resources/lang');
+const LANG_DIR = path.resolve(__dirname, '../../../translations');
 
 beforeEach(() => {
   global.fetch = jest.fn(url => {
