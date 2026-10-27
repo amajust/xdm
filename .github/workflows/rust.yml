@@ -24,6 +24,9 @@ concurrency:
 jobs:
   clippy:
     name: clippy + tests (linux)
+    # Tags skip this job: the release matrix runs the same tests on every
+    # OS, and a redundant linux-only pass just delays the release.
+    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +45,9 @@ jobs:
 
   build:
     name: build (${{ matrix.name }})
+    # Tags skip this job: the release job builds and publishes the same
+    # packages — without this gate a release built everything twice.
+    if: github.ref_type != 'tag'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -77,7 +83,6 @@ jobs:
   release:
     name: release (${{ matrix.name }})
     if: startsWith(github.ref, 'refs/tags/xdm-app-v')
-    needs: [ clippy ]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
