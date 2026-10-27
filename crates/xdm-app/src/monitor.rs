@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -580,6 +581,18 @@ enum Outcome {
     Poll(u64),
 }
 
+/// Whether a browser extension has talked to this monitor at least once
+/// (a `/sync` ping or `/poll` long-poll that passed the origin check).
+static EXTENSION_SEEN: AtomicBool = AtomicBool::new(false);
+
+pub fn extension_seen() -> bool {
+    EXTENSION_SEEN.load(Ordering::Relaxed)
+}
+
+fn mark_extension_seen() {
+    EXTENSION_SEEN.store(true, Ordering::Relaxed);
+}
+
 fn route(app: &Arc<Mutex<App>>, req: &Req) -> Outcome {
     // Origin allowlist: browsers put the page scheme in `Origin`; only
     // extension pages (or requests without an Origin header at all) pass.
@@ -592,6 +605,12 @@ fn route(app: &Arc<Mutex<App>>, req: &Req) -> Outcome {
     }
     if STATE_CHANGING.contains(&req.path.as_str()) && req.method != "POST" {
         return Outcome::Snap(405);
+    }
+    // Any ping/long-poll that passed the origin check means a browser
+    // extension is talking to us — recorded so the GUI can skip the
+    // "install the extension" prompt.
+    if matches!(req.path.as_str(), "/sync" | "/poll") {
+        mark_extension_seen();
     }
     match req.path.as_str() {
         "/sync" => Outcome::Snap(200),

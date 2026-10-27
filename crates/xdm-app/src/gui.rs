@@ -299,6 +299,10 @@ pub enum Message {
     ConfirmDelete,
     /// Delete dialog dismissed (backdrop / cancel).
     CancelDelete,
+    /// Extension-setup card: open the install page for a browser.
+    OpenExtensionPage(&'static str),
+    /// Extension-setup card dismissed.
+    DismissExtension,
     AutoRetry(usize),
     /// Result of the first-tick `window::latest()` lookup.
     GotWindowId(Option<Id>),
@@ -542,6 +546,12 @@ struct Gui {
     modal_error: Option<String>,
     /// Row whose files the user asked to delete; shows the confirm card.
     confirm_delete: Option<usize>,
+    /// When this run started; gates the extension-presence check.
+    started: Instant,
+    /// The extension prompt was shown or handled; do not nag again.
+    extension_prompted: bool,
+    /// The "install the browser extension" card is up.
+    show_extension_setup: bool,
     /// True while a modal dialog is up: the main layout renders with every
     /// color pre-dimmed (see [`shade`]) instead of under a translucent
     /// backdrop, which flickers under incremental software rendering.
@@ -567,6 +577,9 @@ impl Default for Gui {
                 confirm_quit: false,
                 modal_error: None,
                 confirm_delete: None,
+                started: Instant::now(),
+                extension_prompted: false,
+                show_extension_setup: false,
                 dimmed: false,
             };
         };
@@ -585,6 +598,9 @@ impl Default for Gui {
             confirm_quit: false,
             modal_error: None,
             confirm_delete: None,
+            started: Instant::now(),
+            extension_prompted: false,
+            show_extension_setup: false,
             dimmed: false,
         }
     }
@@ -710,6 +726,16 @@ impl Gui {
             }
             Message::Tick => {
                 let mut tasks: Vec<Task<Message>> = Vec::new();
+                // Extension presence: give the extension ~30 s after
+                // startup to connect (connector.js pings /sync), then
+                // prompt once if it never did.
+                if !self.extension_prompted
+                    && self.started.elapsed() > Duration::from_secs(30)
+                    && !monitor::extension_seen()
+                {
+                    self.extension_prompted = true;
+                    self.show_extension_setup = true;
+                }
                 // The main window id is needed for any tray command; capture
                 // it once instead of carrying an id through every message.
                 if self.window_id.is_none() {
@@ -931,6 +957,32 @@ impl Gui {
                 self.persist();
                 Task::none()
             }
+            Message::OpenExtensionPage(browser) => {
+                // Same scheme as the original app: the website carries the
+                // actual store links, so a listing can move without an app
+                // update.
+                let url = format!(
+                    "https://xtremedownloadmanager.com/extension/{browser}/?utm_source=xdm-rust"
+                );
+                match open_url_cmd(&url) {
+                    Some(mut cmd) => {
+                        rt().spawn(async move {
+                            if let Err(e) = cmd.status().await {
+                                eprintln!("xdm-app: open {url} failed: {e}");
+                            }
+                        });
+                    }
+                    None => eprintln!("xdm-app: no browser to open {url}"),
+                }
+                self.extension_prompted = true;
+                self.show_extension_setup = false;
+                Task::none()
+            }
+            Message::DismissExtension => {
+                self.extension_prompted = true;
+                self.show_extension_setup = false;
+                Task::none()
+            }
             Message::AutoRetry(i) => {
                 if let Some(item) = self.downloads.get_mut(i)
                     && item.retry_scheduled
@@ -946,7 +998,8 @@ impl Gui {
         // sync in one place instead of touching each match arm.
         self.dimmed = self.modal_open
             || self.confirm_quit
-            || self.confirm_delete.is_some();
+            || self.confirm_delete.is_some()
+            || self.show_extension_setup;
         task
     }
 
@@ -1271,6 +1324,13 @@ impl Gui {
             stack![
                 mouse_area(layout).on_press(Message::CancelDelete),
                 self.delete_card()
+            ]
+            .into()
+        } else if self.show_extension_setup {
+            // Clicking anywhere outside the card dismisses the prompt.
+            stack![
+                mouse_area(layout).on_press(Message::DismissExtension),
+                self.extension_card()
             ]
             .into()
         } else {
@@ -1818,6 +1878,94 @@ impl Gui {
         .into()
     }
 
+    /// The "install the browser extension" card, shown once per run when no
+    /// extension has connected to the monitor. Mirrors the original app's
+    /// first-run BrowserSetupDialog: website install pages instead of store
+    /// links, so a listing can move without an app update.
+    fn extension_card(&self) -> Element<'_, Message> {
+        let browser_btn = |label: &'static str, browser: &'static str| {
+            button(
+                text(label)
+                    .size(13)
+                    .color(palette::DIALOG_TEXT)
+                    .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .padding([8, 14])
+            .style(|_: &Theme, status| {
+                let bg = matches!(status, button::Status::Hovered)
+                    .then_some(palette::DIALOG_BORDER)
+                    .map(iced::Background::from);
+                button::Style {
+                    background: bg,
+                    text_color: palette::DIALOG_TEXT,
+                    border: iced::Border {
+                        color: palette::DIALOG_BORDER,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::OpenExtensionPage(browser))
+        };
+        container(
+            column![
+                text("Install the browser extension")
+                    .size(17)
+                    .color(palette::DIALOG_TEXT),
+                text(
+                    "XDM Rust needs its browser extension to catch downloads from your \
+                     browser. No extension is connected yet — pick your browser and the \
+                     install page opens in it."
+                )
+                .size(13)
+                .color(palette::DIALOG_DIM),
+                browser_btn("Google Chrome", "chrome"),
+                browser_btn("Firefox", "firefox"),
+                browser_btn("Microsoft Edge", "edge"),
+                browser_btn("Brave", "brave"),
+                browser_btn("Other Chromium browser", "chromium"),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Later").size(13).color(palette::DIALOG_TEXT))
+                        .padding([7, 16])
+                        .style(|_: &Theme, status| {
+                            let bg = matches!(status, button::Status::Hovered)
+                                .then_some(palette::DIALOG_BORDER)
+                                .map(iced::Background::from);
+                            button::Style {
+                                background: bg,
+                                text_color: palette::DIALOG_TEXT,
+                                border: iced::Border {
+                                    color: palette::DIALOG_BORDER,
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
+                                ..button::Style::default()
+                            }
+                        })
+                        .on_press(Message::DismissExtension),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(10),
+        )
+        .width(460)
+        .padding(22)
+        .style(|_| container::Style {
+            background: Some(palette::DIALOG_BG.into()),
+            border: iced::Border {
+                color: palette::DIALOG_BORDER,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+    }
+
     fn modal_card(&self) -> Element<'_, Message> {
         let input_style = move |_: &Theme, _: text_input::Status| text_input::Style {            background: palette::DIALOG_INPUT.into(),
             border: iced::Border {
@@ -2209,6 +2357,29 @@ fn open_dir_cmd(dir: &Path) -> Option<tokio::process::Command> {
         }
         None
     }
+}
+
+/// Opens `url` in the platform's default browser.
+fn open_url_cmd(url: &str) -> Option<tokio::process::Command> {
+    #[cfg(target_os = "macos")]
+    let cmd = {
+        let mut cmd = tokio::process::Command::new("open");
+        cmd.arg(url);
+        cmd
+    };
+    #[cfg(target_os = "windows")]
+    let cmd = {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.args(["/c", "start", "", url]);
+        cmd
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let cmd = {
+        let mut cmd = tokio::process::Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    };
+    Some(cmd)
 }
 
 /// Sibling resume-state file for a download destination, mirroring the
