@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { formatProperties, parseProperties } from './properties';
 
-const LANG_DIR = path.resolve(__dirname, '../../../xdm-app/src/main/resources/lang');
+const LANG_DIR = path.resolve(__dirname, '../../../translations');
 
 test('parses comments, blank lines, separators, escapes and continuations', () => {
   const map = parseProperties([

@@ -1,7 +1,7 @@
 # XDM translation generator
 
 A small web page for translating XDM's UI texts. It lists every English text from
-`xdm-app/src/main/resources/lang/en.txt` and writes a `<code>.txt` file in the same
+`translations/en.txt` and writes a `<code>.txt` file in the same
 `java.util.Properties` format (UTF-8) that `xdm.app.I8N` loads.
 
 - **Start from** an existing translation (from `lang/map`) to fill in only what's missing, or open a
