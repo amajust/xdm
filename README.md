@@ -1,136 +1,103 @@
 <p align="center">
-  <img src="xdm-app/src/main/resources/images/xdm-logo-256.png" height="120" alt="XDM logo"/>
+  <img src="crates/xdm-app/assets/xdm-logo-256.png" width="120" alt="XDM Rust logo"/>
 </p>
 
-<h1 align="center">Xtreme Download Manager</h1>
+<h1 align="center">XDM Rust</h1>
 
 <p align="center">
-  <b>Fast, resumable downloads and one-click video grabbing — right from your browser.</b>
+  <b>A Rust rewrite of Xtreme Download Manager — fast, resumable downloads and one-click video grabbing, right from your browser.</b>
 </p>
 
 <p align="center">
-  <a href="https://github.com/subhra74/xdm/releases"><img src="https://img.shields.io/github/downloads/subhra74/xdm/total.svg?style=flat-square&label=downloads" alt="Total downloads"/></a>
-  <a href="https://github.com/subhra74/xdm/releases/latest"><img src="https://img.shields.io/github/v/release/subhra74/xdm?style=flat-square" alt="Latest release"/></a>
+  <a href="https://github.com/amajust/xdm/actions/workflows/rust.yml"><img src="https://github.com/amajust/xdm/actions/workflows/rust.yml/badge.svg?branch=rust-rewrite" alt="CI status"/></a>
+  <a href="https://github.com/amajust/xdm/releases"><img src="https://img.shields.io/github/v/release/amajust/xdm?include_prereleases&style=flat-square" alt="Latest release"/></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=flat-square" alt="Platforms"/>
-  <img src="https://img.shields.io/badge/status-active%20development-brightgreen?style=flat-square" alt="Active development"/>
+  <img src="https://img.shields.io/badge/status-alpha-orange?style=flat-square" alt="Status: alpha"/>
 </p>
 
 <p align="center">
-  <a href="https://xtremedownloadmanager.com/">Homepage</a> ·
-  <a href="https://xtremedownloadmanager.com/#downloads">Download</a> ·
-  <a href="#-features">Features</a> ·
-  <a href="#-browser-integration">Browser integration</a> ·
-  <a href="#-building-from-source">Build</a> ·
-  <a href="#-translations">Translations</a> ·
-  <a href="CODE_SIGNING_POLICY.md">Code signing policy</a>
-</p>
-
-<p align="center">
-  <a href="https://xtremedownloadmanager.com/#downloads"><img src="docs/assets/download-button.svg" width="360" alt="Download XDM"/></a>
-</p>
-
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=fZ1tZY6RbKc"><img src="docs/assets/xdm-showcase-thumbnail.jpg" width="560" alt="Watch the XDM video on YouTube"/></a>
+  <a href="#-download"><img src="https://img.shields.io/badge/download-latest%20release-33B5E5?style=flat-square" alt="Download"/></a>
 </p>
 
 ---
 
-**Xtreme Download Manager (XDM)** speeds up downloads by splitting them across multiple connections, saves videos
-from streaming sites, and picks up broken downloads exactly where they left off. A companion browser extension hands
-downloads and detected videos straight to the app, so you never have to copy a link by hand.
+<p align="center">
+  <img src="docs/assets/xdm-rust/main-window.png" width="720" alt="XDM Rust main window"/>
+</p>
 
-Wondering why you'd still want a download manager on a fast connection? Read
-[Why use a download manager in an age of fast internet?](docs/why-a-download-manager.md)
+<p align="center">
+  <img src="docs/assets/xdm-rust/new-download-dialog.png" width="480" alt="New download dialog with link validation"/>
+</p>
 
-> [!NOTE]
-> As of 2026 XDM is being rebuilt and is in **active development**.
+## About
 
-## 📸 Screenshots
+**XDM Rust** is a ground-up Rust rewrite of
+[Xtreme Download Manager](https://github.com/subhra74/xdm) — the classic,
+feature-rich download manager for Windows, macOS and Linux originally created
+by Subhra Das ([xtremedownloadmanager.com](https://xtremedownloadmanager.com/)).
 
-| Main window | New download | Download progress |
-|:---:|:---:|:---:|
-| ![XDM main window with the downloads list](screenshots/img1.png) | ![New download dialog](screenshots/img2.png) | ![Download progress window](screenshots/img3.png) |
+All credit for the original application, its design and its years of
+development goes to the upstream project. This repository is a fork that
+replaces the Java codebase with a modern Rust implementation while keeping
+the spirit of the original: fast parallel downloads, browser integration and
+video grabbing.
 
-## ✨ Features
+> **Status: alpha.** The rewrite is under active development on the
+> [`rust-rewrite`](https://github.com/amajust/xdm/tree/rust-rewrite) branch.
+> The original Java application remains available on the `master` branch.
 
-| | |
-|---|---|
-| ⚡ **Faster downloads** | Multi-connection segmented downloading to make the most of your bandwidth. |
-| 🎬 **Video grabber** | Detects and saves videos from streaming sites, including `HLS` (`.m3u8`) and `MPEG-DASH` (`.mpd`) streams, muxed to MP4 with no external tools. |
-| 🔁 **Resume anything** | Recovers downloads interrupted by network drops, crashes or power loss; refresh expired links without starting over. |
-| 📦 **Batch downloads** | Grab many links at once into a single folder. |
-| 🗓️ **Scheduler & queues** | Start and stop downloads on a schedule, limit parallel downloads, shut down when done. |
-| 📋 **Paste from clipboard** | Add one link or a whole list of links straight from the clipboard. |
-| 🌐 **Proxies & auth** | HTTP and SOCKS proxies, and server/proxy authentication. |
-| 🛡️ **Antivirus scan** | Optionally scan finished downloads with your antivirus. |
-| 🖥️ **Cross-platform** | Native-feeling app on Windows, macOS and Linux, with light and dark themes. |
+## Features
 
-## 🧩 Browser integration
+- **Resumable multi-connection engine** — downloads are split across
+  connections and survive restarts, with per-chunk state persisted to disk
+- **Browser integration** — the companion browser extension hands downloads
+  and detected videos straight to the app (see
+  [`browser-extension/`](browser-extension/))
+- **Cross-platform GUI** (iced): category sidebar, download rows with live
+  progress and speed, system tray (Linux), native per-OS taskbar icons
+- **Per-row actions** — open the download's folder in the native file
+  manager, delete a download together with its files (engine-safe)
+- **Link validation** — the New-download dialog explains what's wrong
+  instead of failing silently
 
-XDM works with Chrome, Firefox, Edge, Opera, Vivaldi, Brave and other Chromium- and Firefox-based browsers.
+## Download
 
-| Browser | Extension |
-|---|---|
-| <img src="https://img.shields.io/badge/Chrome-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Chrome"/> | Awaiting review |
-| <img src="https://img.shields.io/badge/Firefox-FF7139?style=flat-square&logo=firefoxbrowser&logoColor=white" alt="Firefox"/> | Awaiting review |
+Grab the latest build from the
+[releases page](https://github.com/amajust/xdm/releases) — every release
+ships `.tar.gz` packages for:
 
-The extension forwards downloads and detected media to the running app over a local-only connection
-(`127.0.0.1:8597`); nothing leaves your machine.
+| Platform | Package |
+| --- | --- |
+| Linux x86_64 | `xdm-app-linux-x86_64.tar.gz` |
+| macOS (Apple Silicon) | `xdm-app-macos-aarch64.tar.gz` |
+| Windows x86_64 | `xdm-app-windows-x86_64.tar.gz` |
 
-## 🛠️ Building from source
+Extract and run the `xdm-app` binary (`tar xf <package>` — Windows 10+
+handles this natively).
 
-**Requirements:** JDK 25 (configured as a [Maven toolchain](packaging/toolchains.sample.xml)) and Maven.
+## Building from source
+
+Requirements: a stable Rust toolchain ([rustup](https://rustup.rs)).
 
 ```bash
-# 1. Point Maven at your JDK 25
-cp packaging/toolchains.sample.xml ~/.m2/toolchains.xml   # then edit jdkHome
+git clone https://github.com/amajust/xdm.git
+cd xdm
+git checkout rust-rewrite
 
-# 2. Build the app (fat jar: xdm-app/target/xdm-app.jar)
-mvn -q -pl xdm-app -am package
+# Linux only: Wayland/x11 build dependencies
+sudo pacman -S libwayland libxkbcommon   # Arch/CachyOS
+# or: sudo apt install libwayland-dev libxkbcommon-dev  # Debian/Ubuntu
 
-# 3. Run it
-java -jar xdm-app/target/xdm-app.jar
+cargo build --release -p xdm-app
+./target/release/xdm-app
 ```
 
-| Module | What it is |
-|---|---|
-| `xdm-core` | Download engine (HTTP, HLS, DASH, batch), no UI dependencies, JDK 8 compatible |
-| `xdm-app` | Swing desktop app (FlatLaf) and browser-integration server |
-| `browser-extension` | Chrome and Firefox extensions |
+CI builds and tests the workspace on Linux, macOS and Windows on every
+change; pushing an `xdm-app-v*` tag publishes a release with all three
+packages automatically.
 
-## 🌍 Translations
+## License
 
-Want XDM in your language? Translations are welcome — see
-[Submitting translations for XDM](https://github.com/subhra74/xdm/wiki/Submitting-translations-for-XDM).
-
-## 🗑️ Uninstalling
-
-- **Windows:** Settings → Apps → Installed apps → *Xtreme Download Manager* → Uninstall.
-- **macOS:** quit XDM, then drag `xdm-app` from Applications to the Trash.
-- **Linux:** `sudo apt remove xdm-app` (Debian/Ubuntu), `sudo dnf remove xdm-app` (Fedora) or
-  `sudo pacman -R xdm-app` (Arch).
-
-Uninstalling keeps your settings and download list. To remove them too, delete the data folder:
-`%LOCALAPPDATA%\xdm-app` (Windows), `~/Library/Application Support/xdm-app` (macOS) or
-`~/.local/share/xdm-app` (Linux).
-
-## 🔏 Code signing policy
-
-Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
-Who builds, reviews and approves signed releases: see the [code signing policy](CODE_SIGNING_POLICY.md).
-
-## 🔒 Privacy
-
-XDM has no accounts, analytics or tracking, and keeps your data on your computer. See the [privacy policy](PRIVACY.md).
-
-## 📄 License
-
-XDM is free software, licensed under the [GNU General Public License v3.0](LICENSE). XDM 8 and earlier were released
-under GPL v2.
-
----
-
-<p align="center">
-  Made with ☕ by <a href="https://github.com/subhra74">subhra74</a> and contributors ·
-  <a href="https://xtremedownloadmanager.com/">xtremedownloadmanager.com</a>
-</p>
+This project is licensed under the
+[GNU GPL v3](LICENSE), inherited from the original
+Xtreme Download Manager by Subhra Das.
